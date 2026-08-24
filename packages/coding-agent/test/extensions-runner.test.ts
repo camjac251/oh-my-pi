@@ -2838,11 +2838,13 @@ describe("ExtensionRunner", () => {
 				export default function(pi) {
 					pi.on("tool_call", async (event) => {
 						if (event.toolName !== "bash") return;
+						globalThis.__finalAuthorizationFlag = event.finalAuthorization;
 						return { input: { command: "echo revised" } };
 					});
 				}
 			`;
 			fs.writeFileSync(path.join(extensionsDir, "tool-call-override.ts"), extCode);
+			const globalState = globalThis as typeof globalThis & { __finalAuthorizationFlag?: true };
 
 			const result = await loadTestExtensions();
 			const runner = new ExtensionRunner(
@@ -2857,12 +2859,14 @@ describe("ExtensionRunner", () => {
 			const resultMessage = await wrapped.execute("tool-call-id", { command: "echo original" });
 
 			expect(resultMessage.content).toEqual([{ type: "text", text: "ran" }]);
+			expect(globalState.__finalAuthorizationFlag).toBeUndefined();
 			const executed = fs
 				.readFileSync(recordPath, "utf8")
 				.trim()
 				.split("\n")
 				.map(line => JSON.parse(line));
 			expect(executed).toEqual([{ command: "echo revised" }]);
+			delete globalState.__finalAuthorizationFlag;
 		});
 
 		it("ignores a replacement input when the handler also blocks", async () => {
@@ -2908,6 +2912,18 @@ describe("ExtensionRunner", () => {
 					fs.appendFileSync(recordPath, `${JSON.stringify(params)}\n`);
 					return { content: [{ type: "text", text: "ran" }] };
 				},
+			} as AgentTool;
+		}
+
+		function createApprovalTool(): AgentTool {
+			return {
+				name: "dangerous_tool",
+				label: "Dangerous Tool",
+				description: "Test approval tool",
+				parameters: Type.Object({}),
+				strict: true,
+				approval: "exec" as const,
+				execute: async () => ({ content: [{ type: "text", text: "ran" }] }),
 			} as AgentTool;
 		}
 
@@ -3297,6 +3313,222 @@ describe("ExtensionRunner", () => {
 
 			expect(order).toEqual(["tool_call", "tool_approval_requested", "ui_select"]);
 			delete globalState.__orderEvents;
+		});
+
+		it("authorizes the final rewritten input before native approval", async () => {
+			const events: Array<Record<string, unknown>> = [];
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_call", async (event) => {
+						globalThis.__authorizationEvents.push({
+							type: event.type,
+							finalAuthorization: event.finalAuthorization,
+						});
+						return { input: { command: "revised-command" } };
+					});
+					pi.on("tool_authorization", async (event) => {
+						globalThis.__authorizationEvents.push({
+							type: event.type,
+							command: event.input.command,
+							nativeDecision: event.nativeDecision,
+							manualApprovalRequired: event.manualApprovalRequired,
+						});
+						return { decision: "allow" };
+					});
+					pi.on("tool_approval_requested", async () => {
+						globalThis.__authorizationEvents.push({ type: "tool_approval_requested" });
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-final-input.ts"), extCode);
+			const globalState = globalThis as typeof globalThis & { __authorizationEvents?: typeof events };
+			globalState.__authorizationEvents = events;
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const select = vi.fn(async () => "Approve");
+			initApprovalRunner(runner, select);
+
+			const executed: unknown[] = [];
+			const promptTool = {
+				name: "prompt_tool",
+				label: "Prompt Tool",
+				description: "Always prompt-gated",
+				parameters: Type.Object({ command: Type.String() }),
+				strict: true,
+				approval: "exec" as const,
+				execute: async (_id: string, params: unknown) => {
+					executed.push(params);
+					return { content: [{ type: "text", text: "ran" }] };
+				},
+			} as AgentTool;
+			const wrapped = new ExtensionToolWrapper(promptTool, runner);
+
+			await wrapped.execute(
+				"call-final-authorization",
+				{ command: "original-command" },
+				undefined,
+				undefined,
+				alwaysAskContext,
+			);
+
+			expect(events).toEqual([
+				{ type: "tool_call", finalAuthorization: true },
+				{
+					type: "tool_authorization",
+					command: "revised-command",
+					nativeDecision: "ask",
+					manualApprovalRequired: false,
+				},
+			]);
+			expect(select).not.toHaveBeenCalled();
+			expect(executed).toEqual([{ command: "revised-command" }]);
+			delete globalState.__authorizationEvents;
+		});
+
+		it("keeps ask when later final authorization handlers allow", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async () => ({ decision: "allow" }));
+					pi.on("tool_authorization", async () => ({
+						decision: "ask",
+						reason: "Protected external write",
+					}));
+					pi.on("tool_authorization", async () => ({ decision: "allow" }));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-ask.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const select = vi.fn(async () => "Approve");
+			initApprovalRunner(runner, select);
+
+			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+			await wrapped.execute("call-authorization-ask", {}, undefined, undefined, yoloContext);
+
+			expect(select).toHaveBeenCalledWith(expect.stringContaining("Protected external write"), ["Approve", "Deny"]);
+		});
+
+		it("keeps deny when later final authorization handlers allow", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async () => ({ decision: "ask" }));
+					pi.on("tool_authorization", async () => ({
+						decision: "deny",
+						reason: "Blocked by final policy",
+					}));
+					pi.on("tool_authorization", async () => ({ decision: "allow" }));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-deny.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+
+			await expect(
+				wrapped.execute("call-authorization-deny", {}, undefined, undefined, yoloContext),
+			).rejects.toThrow("Blocked by final policy");
+		});
+
+		it("denies execution when a final authorization handler fails", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async () => {
+						throw new Error("authorization failed");
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-failure.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+
+			await expect(
+				wrapped.execute("call-authorization-failure", {}, undefined, undefined, yoloContext),
+			).rejects.toThrow("authorization failed");
+		});
+
+		it("denies execution for an unsupported final authorization decision", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async () => ({ decision: "unsupported" }));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-unsupported.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+
+			await expect(
+				wrapped.execute("call-authorization-unsupported", {}, undefined, undefined, yoloContext),
+			).rejects.toThrow("unsupported tool authorization decision");
+		});
+
+		it("does not let final authorization bypass an explicit prompt policy", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async () => ({ decision: "allow" }));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-explicit-prompt.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const select = vi.fn(async () => "Approve");
+			initApprovalRunner(runner, select);
+
+			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+			await wrapped.execute("call-explicit-prompt", {}, undefined, undefined, {
+				settings: {
+					get: (key: string) => {
+						if (key === "tools.approvalMode") return "yolo";
+						if (key === "tools.approval") return { dangerous_tool: "prompt" };
+						return undefined;
+					},
+				} as never,
+			} as never);
+
+			expect(select).toHaveBeenCalledTimes(1);
 		});
 	});
 	describe("hasHandlers", () => {

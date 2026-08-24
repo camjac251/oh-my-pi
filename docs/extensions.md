@@ -304,12 +304,15 @@ Cancelable pre-events:
 
 ### Tool lifecycle
 
-- `tool_call` (pre-exec, may block, or revise the tool's execution `input`; for model-issued calls it fires at arg-prep time in the agent loop, so a revision is revalidated and seen by concurrency scheduling, execution events, the persisted assistant message, and the approval gate alike)
+- `tool_call` (pre-exec, may block, or revise the tool's execution `input`; for model-issued calls it fires at arg-prep time in the agent loop, so a revision is revalidated and seen by concurrency scheduling, execution events, the persisted assistant message, and the approval gate alike; `finalAuthorization: true` means a later `tool_authorization` event will gate the final rewritten input)
+- `tool_authorization` (final pre-exec authorization after all `tool_call` rewrites and immediately before native approval; receives the exact raw execution `input`, native allow/ask decision, approval mode, and whether explicit policy or provider safety requires a human; returns `{ decision: "allow" | "ask" | "deny", reason?: string }`)
 - `tool_result` (post-exec, may patch content/details/isError)
 - `tool_execution_start` / `tool_execution_update` / `tool_execution_end` (observability)
 - `tool_approval_requested` / `tool_approval_resolved` (observability; emitted by `wrapper.ts` only when a tool requires approval and an approval handler is registered)
 
 `tool_result` is middleware-style: handlers run in extension order and each sees prior modifications.
+
+`tool_authorization` is strictest-wins across handlers: deny outranks ask, ask outranks allow, and handler failure, timeout, cancellation, or an unsupported decision denies. Allow may satisfy an ordinary prompt produced by `always-ask` or `write` mode, but it cannot bypass an explicit per-tool prompt policy or a provider safety check. Ask forces the native approval UI even when native policy would allow.
 
 ### Reliability/runtime signals
 
@@ -417,7 +420,7 @@ pi.registerTool({
 });
 ```
 
-`tool_call`/`tool_result` intercept all tools once the registry is wrapped in `sdk.ts`, including built-ins and extension/custom tools. `ToolDefinition` also supports optional `hidden`, `defaultInactive`, `loadMode` (`"discoverable"` by default, or `"essential"`), `deferrable`, `approval` (`"exec"` by default), `strict`, `mcpServerName`, `mcpToolName`, `renderCall`, and `renderResult` fields.
+`tool_call`/`tool_authorization`/`tool_result` intercept all tools once the registry is wrapped in `sdk.ts`, including built-ins and extension/custom tools. `ToolDefinition` also supports optional `hidden`, `defaultInactive`, `loadMode` (`"discoverable"` by default, or `"essential"`), `deferrable`, `approval` (`"exec"` by default), `strict`, `mcpServerName`, `mcpToolName`, `renderCall`, and `renderResult` fields.
 
 ### File write fallback (`registerFileWriteFallback`)
 

@@ -64,6 +64,8 @@ import type {
 	SessionCompactingResult,
 	SessionStopEvent,
 	SessionStopEventResult,
+	ToolAuthorizationEvent,
+	ToolAuthorizationEventResult,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolRegistrationListener,
@@ -332,6 +334,7 @@ const MAX_PENDING_MCP_NOTIFICATIONS = 100;
  */
 type RunnerEmitEvent = Exclude<
 	ExtensionEvent,
+	| ToolAuthorizationEvent
 	| ToolCallEvent
 	| ToolResultEvent
 	| UserBashEvent
@@ -1506,6 +1509,59 @@ export class ExtensionRunner {
 
 		if (signal?.aborted) {
 			return { block: true, reason: `Tool execution was cancelled while an extension handler was pending` };
+		}
+		return result;
+	}
+
+	/**
+	 * Emit final authorization after all `tool_call` rewrites have settled.
+	 * Every handler sees the exact execution input and decisions combine by strictness.
+	 */
+	async emitToolAuthorization(
+		event: ToolAuthorizationEvent,
+		signal?: AbortSignal,
+	): Promise<ToolAuthorizationEventResult | undefined> {
+		const ctx = this.createContext();
+		const timeoutMs = normalizeHandlerTimeout(
+			this.settings?.get("extensionHandlers.toolCallTimeoutMs") ?? extensionHandlerTimeoutMs,
+		);
+		let result: ToolAuthorizationEventResult | undefined;
+
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get("tool_authorization");
+			if (!handlers || handlers.length === 0) continue;
+
+			for (const handler of handlers) {
+				const handlerResult = (await this.#runHandlerWithTimeout(
+					handler,
+					event,
+					ctx,
+					ext,
+					timeoutMs,
+					(kind, message) => ({
+						decision: "deny" as const,
+						reason:
+							kind === "timeout"
+								? `Extension ${ext.path} timed out after ${timeoutMs}ms`
+								: `Extension ${ext.path} failed: ${message}`,
+					}),
+					signal,
+				)) as ToolAuthorizationEventResult | undefined;
+
+				if (!handlerResult) continue;
+				if (!(["allow", "ask", "deny"] as const).includes(handlerResult.decision)) {
+					return {
+						decision: "deny",
+						reason: `Extension ${ext.path} returned an unsupported tool authorization decision`,
+					};
+				}
+				if (handlerResult.decision === "deny") return handlerResult;
+				if (handlerResult.decision === "ask" || result === undefined) result = handlerResult;
+			}
+		}
+
+		if (signal?.aborted) {
+			return { decision: "deny", reason: "Tool authorization was cancelled while an extension handler was pending" };
 		}
 		return result;
 	}
