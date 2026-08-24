@@ -257,6 +257,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const cancelPreflight = (): void => {
 			if (!loopDispatchedToolCall) this.runner.cancelToolCallPreflight?.(toolCallId);
 		};
+		const hasFinalAuthorization = this.runner.hasHandlers("tool_authorization");
 		if (!loopEmittedToolCall && this.runner.hasHandlers("tool_call")) {
 			try {
 				const callResult = (await this.runner.emitToolCall(
@@ -264,6 +265,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						type: "tool_call",
 						toolName: this.tool.name,
 						toolCallId,
+						...(hasFinalAuthorization ? { finalAuthorization: true as const } : {}),
 						input: normalizeToolEventInput(
 							this.tool.name,
 							resolveToolEventInput(this.tool, toolEventArgs(params, context)),
@@ -328,12 +330,41 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			context !== undefined &&
 			Object.hasOwn(context, "acpApprovedArgs") &&
 			Bun.deepEquals(effectiveParams, context.acpApprovedArgs);
-		const approvalCheck = {
+		let approvalCheck = {
 			required:
 				pendingSafetyChecks.length > 0 ||
 				(resolved.policy === "prompt" && !acpBypass && (explicitPrompt || !xdevBypass)),
 			reason: resolved.reason,
 		};
+		const manualApprovalRequired = pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && explicitPrompt);
+		if (hasFinalAuthorization) {
+			const sessionId = context?.sessionManager?.getSessionId() ?? "";
+			const authorization = await this.runner.emitToolAuthorization(
+				{
+					type: "tool_authorization",
+					sessionId,
+					toolName: this.tool.name,
+					toolCallId,
+					input: effectiveParams as Record<string, unknown>,
+					approvalMode,
+					nativeDecision: approvalCheck.required ? "ask" : "allow",
+					manualApprovalRequired,
+					...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
+				},
+				signal,
+			);
+			if (authorization?.decision === "deny") {
+				throw new Error(authorization.reason || `Tool execution was denied by an extension: ${this.tool.name}`);
+			}
+			if (authorization?.decision === "ask") {
+				approvalCheck = {
+					required: true,
+					reason: authorization.reason || approvalCheck.reason,
+				};
+			} else if (authorization?.decision === "allow" && !manualApprovalRequired) {
+				approvalCheck = { required: false, reason: approvalCheck.reason };
+			}
+		}
 
 		if (approvalCheck.required) {
 			const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];

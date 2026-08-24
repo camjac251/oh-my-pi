@@ -4556,13 +4556,14 @@ export class AgentSession implements SettingsScope {
 			? { actions: computer.actions, pendingSafetyChecks: computer.pendingSafetyChecks }
 			: ctx.args;
 		runner.markToolCallEmitted(ctx.toolCall.id, ctx.tool.name);
-		let callResult: Awaited<ReturnType<ExtensionRunner["emitToolCall"]>>;
+		let callResult: ToolCallEventResult | undefined;
 		try {
 			callResult = await runner.emitToolCall(
 				{
 					type: "tool_call",
 					toolName: ctx.tool.name,
 					toolCallId: ctx.toolCall.id,
+					...(runner.hasHandlers("tool_authorization") ? { finalAuthorization: true as const } : {}),
 					input: normalizeToolEventInput(ctx.tool.name, resolveToolEventInput(ctx.tool, eventArgs)),
 				},
 				signal,
