@@ -319,12 +319,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			throw denyError(resolved, this.tool.name);
 		}
 		const pendingSafetyChecks = computerSafetyChecks(context);
-		// Outer approvals only cover the original input. `xd://` approval skips
-		// tier-only prompts while the same object flows through; ACP approval also
-		// satisfies explicit prompts, but compares against a deep snapshot because
-		// handlers can mutate the original argument object in place. Denies were
-		// enforced above, and provider safety checks remain independently required.
-		const explicitPrompt = resolved.override || Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
+		// Outer approvals cover only unchanged input; provider safety checks remain independently required.
+		const manualPromptRequired = resolved.policy === "prompt" && resolved.source !== "mode";
 		const xdevBypass = context?.xdevApproved === true && effectiveParams === params;
 		const acpBypass =
 			context !== undefined &&
@@ -333,11 +329,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		let approvalCheck = {
 			required:
 				pendingSafetyChecks.length > 0 ||
-				(resolved.policy === "prompt" && !acpBypass && (explicitPrompt || !xdevBypass)),
+				(resolved.policy === "prompt" && !acpBypass && (manualPromptRequired || !xdevBypass)),
 			reason: resolved.reason,
 		};
-		const manualApprovalRequired = pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && explicitPrompt);
 		if (hasFinalAuthorization) {
+			const manualApprovalRequired = pendingSafetyChecks.length > 0 || manualPromptRequired;
 			const sessionId = context?.sessionManager?.getSessionId() ?? "";
 			const authorization = await this.runner.emitToolAuthorization(
 				{
@@ -345,7 +341,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					sessionId,
 					toolName: this.tool.name,
 					toolCallId,
-					input: effectiveParams as Record<string, unknown>,
+					input: toolEventArgs(effectiveParams, context),
 					approvalMode,
 					nativeDecision: approvalCheck.required ? "ask" : "allow",
 					manualApprovalRequired,
