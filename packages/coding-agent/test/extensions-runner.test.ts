@@ -3527,6 +3527,35 @@ describe("ExtensionRunner", () => {
 			expect(select).toHaveBeenCalledWith(expect.stringContaining("Protected external write"), ["Approve", "Deny"]);
 		});
 
+		it("explains extension-required approval when no interactive UI is available", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async () => ({
+						decision: "ask",
+						reason: "Protected external write",
+					}));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-headless-ask.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+
+			await expect(
+				wrapped.execute("call-authorization-headless-ask", {}, undefined, undefined, yoloContext),
+			).rejects.toThrow(
+				'Tool "dangerous_tool" requires approval from an extension but no interactive UI is available.\n' +
+					"Use an interactive UI or change the extension policy to allow this tool call.",
+			);
+		});
+
 		it("keeps an earlier ask reason when a later ask omits one", async () => {
 			const extCode = `
 				export default function(pi) {

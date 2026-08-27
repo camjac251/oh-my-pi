@@ -312,7 +312,7 @@ Cancelable pre-events:
 
 `tool_result` is middleware-style: handlers run in extension order and each sees prior modifications.
 
-`tool_authorization` is strictest-wins across handlers: deny outranks ask, ask outranks allow, and handler failure, timeout, cancellation, or an unsupported decision denies. Each handler receives its own input snapshot, so mutations cannot rewrite execution or affect later handlers. A later ask without a reason preserves the previous nonempty ask reason. Allow may satisfy an ordinary prompt produced by `always-ask` or `write` mode, but it cannot bypass a prompt required by tool policy, an explicit per-tool prompt policy, or a provider safety check. Ask forces the native approval UI even when native policy would allow. Human dialog time is excluded from the handler timeout budget.
+`tool_authorization` is strictest-wins across handlers: deny outranks ask, ask outranks allow, and handler failure, timeout, cancellation, or an unsupported decision denies. Each handler receives its own input snapshot, so mutations cannot rewrite execution or affect later handlers. A later ask without a reason preserves the previous nonempty ask reason. Allow may satisfy an ordinary prompt produced by `always-ask` or `write` mode, but it cannot bypass a prompt required by tool policy, an explicit per-tool prompt policy, or a provider safety check. Ask forces the native approval UI even when native policy would allow. In a headless session, an extension ask fails closed and requires either an interactive UI or an extension policy change; native approval settings cannot override it. Human dialog time is excluded from the handler timeout budget.
 
 ### Reliability/runtime signals
 
