@@ -1561,7 +1561,7 @@ export class ExtensionRunner {
 		}
 
 		if (signal?.aborted) {
-			return { decision: "deny", reason: "Tool authorization was cancelled while an extension handler was pending" };
+			return { decision: "deny", reason: "Tool authorization was canceled while an extension handler was pending" };
 		}
 		return result;
 	}

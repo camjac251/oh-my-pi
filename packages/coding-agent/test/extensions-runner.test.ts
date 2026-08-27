@@ -3475,6 +3475,84 @@ describe("ExtensionRunner", () => {
 			).rejects.toThrow("authorization failed");
 		});
 
+		it("denies execution when a final authorization handler times out", async () => {
+			const extensionPath = path.join(extensionsDir, "tool-authorization-timeout.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
+					export default function(pi) {
+						pi.on("tool_authorization", async () => {
+							await Promise.withResolvers().promise;
+						});
+					}
+				`,
+			);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+				undefined,
+				Settings.isolated({ "extensionHandlers.toolCallTimeoutMs": 10 }),
+			);
+			const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ran" }] }));
+			const wrapped = new ExtensionToolWrapper({ ...createApprovalTool(), execute } as AgentTool, runner);
+
+			await expect(
+				wrapped.execute("call-authorization-timeout", {}, undefined, undefined, yoloContext),
+			).rejects.toThrow(`Extension ${extensionPath} timed out after 10ms`);
+			expect(execute).not.toHaveBeenCalled();
+		});
+
+		it("denies execution when final authorization is canceled", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async () => {
+						globalThis.__authorizationStarted();
+						await Promise.withResolvers().promise;
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-cancel.ts"), extCode);
+
+			const started = Promise.withResolvers<void>();
+			const globalState = globalThis as typeof globalThis & { __authorizationStarted?: () => void };
+			globalState.__authorizationStarted = started.resolve;
+			try {
+				const result = await loadTestExtensions();
+				const runner = new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ran" }] }));
+				const wrapped = new ExtensionToolWrapper({ ...createApprovalTool(), execute } as AgentTool, runner);
+				const controller = new AbortController();
+				const execution = wrapped.execute(
+					"call-authorization-cancel",
+					{},
+					controller.signal,
+					undefined,
+					yoloContext,
+				);
+
+				await started.promise;
+				controller.abort();
+
+				await expect(execution).rejects.toThrow(
+					"Tool authorization was canceled while an extension handler was pending",
+				);
+				expect(execute).not.toHaveBeenCalled();
+			} finally {
+				delete globalState.__authorizationStarted;
+			}
+		});
+
 		it("denies execution for an unsupported final authorization decision", async () => {
 			const extCode = `
 				export default function(pi) {
@@ -3529,6 +3607,46 @@ describe("ExtensionRunner", () => {
 			} as never);
 
 			expect(select).toHaveBeenCalledTimes(1);
+		});
+
+		it("does not let final authorization bypass provider safety checks", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async () => ({ decision: "allow" }));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-provider-safety.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ran" }] }));
+			const wrapped = new ExtensionToolWrapper({ ...createApprovalTool(), execute } as AgentTool, runner);
+			const context = {
+				settings: { get: (key: string) => (key === "tools.approvalMode" ? "yolo" : {}) },
+				toolCall: {
+					batchId: "provider-safety-batch",
+					index: 0,
+					total: 1,
+					toolCalls: [{ id: "call-provider-safety", name: "dangerous_tool" }],
+					providerMetadata: {
+						type: "computer",
+						providerItemId: "provider-item",
+						actions: [{ type: "click", x: 10, y: 20, button: "left" }],
+						pendingSafetyChecks: [{ id: "confirm-action", message: "Confirm external action" }],
+					},
+				},
+			} as never;
+
+			await expect(wrapped.execute("call-provider-safety", {}, undefined, undefined, context)).rejects.toThrow(
+				'Tool "dangerous_tool" has pending provider safety checks but no interactive UI is available.',
+			);
+			expect(execute).not.toHaveBeenCalled();
 		});
 	});
 	describe("hasHandlers", () => {
