@@ -332,6 +332,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				(resolved.policy === "prompt" && !acpBypass && (manualPromptRequired || !xdevBypass)),
 			reason: resolved.reason,
 		};
+		let extensionApprovalRequired = false;
 		if (hasFinalAuthorization) {
 			const manualApprovalRequired = pendingSafetyChecks.length > 0 || manualPromptRequired;
 			const sessionId = context?.sessionManager?.getSessionId() ?? "";
@@ -353,6 +354,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				throw new Error(authorization.reason || `Tool execution was denied by an extension: ${this.tool.name}`);
 			}
 			if (authorization?.decision === "ask") {
+				extensionApprovalRequired = true;
 				approvalCheck = {
 					required: true,
 					reason: authorization.reason || approvalCheck.reason,
@@ -406,6 +408,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				if (pendingSafetyChecks.length > 0) {
 					throw new Error(
 						`Tool "${this.tool.name}" has pending provider safety checks but no interactive UI is available.`,
+					);
+				}
+				if (extensionApprovalRequired) {
+					throw new Error(
+						`Tool "${this.tool.name}" requires approval from an extension but no interactive UI is available.\n` +
+							"Use an interactive UI or change the extension policy to allow this tool call.",
 					);
 				}
 				throw new Error(
