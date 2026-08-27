@@ -263,14 +263,15 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// and tool-demanded overrides still prompt. Provider safety checks are
 		// stronger: yolo, per-tool allow, and xdev approval never acknowledge
 		// them on the user's behalf.
-		const explicitPrompt = resolved.override || Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
+		const manualPromptRequired = resolved.policy === "prompt" && resolved.source !== "mode";
 		const xdevBypass = context?.xdevApproved === true && effectiveParams === params;
 		let approvalCheck = {
-			required: pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && (explicitPrompt || !xdevBypass)),
+			required:
+				pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && (manualPromptRequired || !xdevBypass)),
 			reason: resolved.reason,
 		};
-		const manualApprovalRequired = pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && explicitPrompt);
 		if (hasFinalAuthorization) {
+			const manualApprovalRequired = pendingSafetyChecks.length > 0 || manualPromptRequired;
 			const sessionId = context?.sessionManager?.getSessionId() ?? "";
 			const authorization = await this.runner.emitToolAuthorization(
 				{
@@ -278,7 +279,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					sessionId,
 					toolName: this.tool.name,
 					toolCallId,
-					input: effectiveParams as Record<string, unknown>,
+					input: toolEventArgs(effectiveParams, context),
 					approvalMode,
 					nativeDecision: approvalCheck.required ? "ask" : "allow",
 					manualApprovalRequired,

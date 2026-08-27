@@ -934,12 +934,12 @@ export interface ToolAuthorizationEvent {
 	sessionId: string;
 	toolCallId: string;
 	toolName: string;
-	/** Exact raw input that will be passed to the tool when authorization succeeds. */
+	/** Detached authorization view of the final input. Computer calls expose provider-native actions and safety checks. */
 	input: Record<string, unknown>;
 	approvalMode: ApprovalMode;
 	/** Native decision before extension authorization is combined with it. */
 	nativeDecision: "allow" | "ask";
-	/** True when an explicit user rule or provider safety check requires a human. */
+	/** True when tool policy, an explicit user rule, or a provider safety check requires a human. */
 	manualApprovalRequired: boolean;
 	reason?: string;
 }

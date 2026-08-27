@@ -2935,6 +2935,7 @@ describe("ExtensionRunner", () => {
 		const initApprovalRunner = (
 			runner: ExtensionRunner,
 			select: (title: string, options: string[]) => Promise<string | undefined>,
+			uiOverrides: Partial<ExtensionUIContext> = {},
 		) => {
 			runner.initialize(
 				{
@@ -2963,7 +2964,7 @@ describe("ExtensionRunner", () => {
 					getSystemPrompt: () => [],
 				} as never,
 				undefined,
-				{ select, notify: () => {} } as never,
+				{ select, notify: () => {}, ...uiOverrides } as never,
 			);
 		};
 		const alwaysAskContext = {
@@ -3392,6 +3393,110 @@ describe("ExtensionRunner", () => {
 			delete globalState.__authorizationEvents;
 		});
 
+		it("isolates authorization input mutations from execution and later handlers", async () => {
+			const observedCommands: unknown[] = [];
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async (event) => {
+						event.input.command = "mutated-command";
+						return { decision: "allow" };
+					});
+					pi.on("tool_authorization", async (event) => {
+						globalThis.__observedAuthorizationCommands.push(event.input.command);
+						return { decision: "allow" };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-input-isolation.ts"), extCode);
+			const globalState = globalThis as typeof globalThis & {
+				__observedAuthorizationCommands?: typeof observedCommands;
+			};
+			globalState.__observedAuthorizationCommands = observedCommands;
+
+			try {
+				const result = await loadTestExtensions();
+				const runner = new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				const executed: unknown[] = [];
+				const tool = {
+					name: "guarded_command",
+					label: "Guarded Command",
+					description: "Records the authorized command",
+					parameters: Type.Object({ command: Type.String() }),
+					strict: true,
+					approval: "exec" as const,
+					execute: async (_id: string, params: unknown) => {
+						executed.push(params);
+						return { content: [{ type: "text", text: "ran" }] };
+					},
+				} as AgentTool;
+				const wrapped = new ExtensionToolWrapper(tool, runner);
+
+				await wrapped.execute(
+					"call-authorization-input-isolation",
+					{ command: "approved-command" },
+					undefined,
+					undefined,
+					yoloContext,
+				);
+
+				expect(observedCommands).toEqual(["approved-command"]);
+				expect(executed).toEqual([{ command: "approved-command" }]);
+			} finally {
+				delete globalState.__observedAuthorizationCommands;
+			}
+		});
+
+		it("exposes provider-native computer actions to final authorization", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async (event) => {
+						const actions = Array.isArray(event.input.actions) ? event.input.actions : [];
+						return actions[0]?.type === "click"
+							? { decision: "deny", reason: "Blocked computer action" }
+							: { decision: "allow" };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-computer-actions.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ran" }] }));
+			const wrapped = new ExtensionToolWrapper({ ...createApprovalTool(), execute } as AgentTool, runner);
+			const context = {
+				settings: { get: (key: string) => (key === "tools.approvalMode" ? "yolo" : {}) },
+				toolCall: {
+					batchId: "computer-action-batch",
+					index: 0,
+					total: 1,
+					toolCalls: [{ id: "call-computer-action", name: "dangerous_tool" }],
+					providerMetadata: {
+						type: "computer",
+						providerItemId: "provider-item",
+						actions: [{ type: "click", x: 10, y: 20, button: "left" }],
+						pendingSafetyChecks: [],
+					},
+				},
+			} as never;
+
+			await expect(wrapped.execute("call-computer-action", {}, undefined, undefined, context)).rejects.toThrow(
+				"Blocked computer action",
+			);
+			expect(execute).not.toHaveBeenCalled();
+		});
+
 		it("keeps ask when later final authorization handlers allow", async () => {
 			const extCode = `
 				export default function(pi) {
@@ -3418,6 +3523,35 @@ describe("ExtensionRunner", () => {
 
 			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
 			await wrapped.execute("call-authorization-ask", {}, undefined, undefined, yoloContext);
+
+			expect(select).toHaveBeenCalledWith(expect.stringContaining("Protected external write"), ["Approve", "Deny"]);
+		});
+
+		it("keeps an earlier ask reason when a later ask omits one", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async () => ({
+						decision: "ask",
+						reason: "Protected external write",
+					}));
+					pi.on("tool_authorization", async () => ({ decision: "ask" }));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-ask-reason.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const select = vi.fn(async () => "Approve");
+			initApprovalRunner(runner, select);
+
+			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+			await wrapped.execute("call-authorization-ask-reason", {}, undefined, undefined, yoloContext);
 
 			expect(select).toHaveBeenCalledWith(expect.stringContaining("Protected external write"), ["Approve", "Deny"]);
 		});
@@ -3607,6 +3741,99 @@ describe("ExtensionRunner", () => {
 			} as never);
 
 			expect(select).toHaveBeenCalledTimes(1);
+		});
+
+		it("does not let final authorization bypass a tool-owned prompt in yolo mode", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async () => ({ decision: "allow" }));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-tool-prompt.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const select = vi.fn(async () => "Approve");
+			initApprovalRunner(runner, select);
+			const tool = {
+				...createApprovalTool(),
+				approval: () => ({
+					tier: "exec" as const,
+					override: true,
+					policy: "prompt" as const,
+					reason: "Prompt required by bash pattern: curl *",
+				}),
+			} as AgentTool;
+			const wrapped = new ExtensionToolWrapper(tool, runner);
+
+			await wrapped.execute("call-tool-owned-prompt", {}, undefined, undefined, yoloContext);
+
+			expect(select).toHaveBeenCalledWith(expect.stringContaining("Prompt required by bash pattern: curl *"), [
+				"Approve",
+				"Deny",
+			]);
+		});
+
+		it("pauses final authorization timeouts while extension dialogs are open", async () => {
+			const extensionPath = path.join(extensionsDir, "tool-authorization-dialog.ts");
+			fs.writeFileSync(
+				extensionPath,
+				`
+					export default function(pi) {
+						pi.on("tool_authorization", async (_event, ctx) => {
+							const approved = await ctx.ui.confirm("Protected write", "Allow this action?");
+							return approved ? { decision: "allow" } : { decision: "deny" };
+						});
+					}
+				`,
+			);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+				undefined,
+				Settings.isolated({ "extensionHandlers.toolCallTimeoutMs": 10 }),
+			);
+			const dialog = Promise.withResolvers<boolean>();
+			const confirmationStarted = Promise.withResolvers<void>();
+			const confirm: ExtensionUIContext["confirm"] = async () => {
+				confirmationStarted.resolve();
+				return await dialog.promise;
+			};
+			initApprovalRunner(runner, async () => undefined, { confirm });
+			vi.useFakeTimers();
+			let now = 0;
+			const performanceNow = vi.spyOn(performance, "now").mockImplementation(() => now);
+			try {
+				const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+				const execution = wrapped.execute("call-authorization-dialog", {}, undefined, undefined, yoloContext);
+				const settled = execution.then(
+					value => ({ value, error: undefined }),
+					error => ({ value: undefined, error }),
+				);
+
+				await confirmationStarted.promise;
+				now = 100;
+				vi.advanceTimersByTime(100);
+				dialog.resolve(true);
+
+				const outcome = await settled;
+				expect(outcome.error).toBeUndefined();
+				expect(outcome.value).toEqual({ content: [{ type: "text", text: "ran" }] });
+			} finally {
+				performanceNow.mockRestore();
+				vi.useRealTimers();
+			}
 		});
 
 		it("does not let final authorization bypass provider safety checks", async () => {

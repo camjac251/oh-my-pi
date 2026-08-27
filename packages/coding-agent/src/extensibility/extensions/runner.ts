@@ -1271,7 +1271,7 @@ export class ExtensionRunner {
 		onFailure?: (kind: "timeout" | "error", message: string) => R,
 		outerSignal?: AbortSignal,
 	): Promise<R | undefined> {
-		// `session_stop` carries its own signal on the event; `tool_call` receives
+		// `session_stop` carries its own signal on the event; tool gates receive
 		// the outer dispatch signal (loop request or wrapper execute) so an abort
 		// while a handler awaits a human dialog cancels the dialog and settles the
 		// gate without executing the underlying tool. Compose whichever apply.
@@ -1295,7 +1295,11 @@ export class ExtensionRunner {
 							result = await this.#toolRegistrationScope.run(registrationScope, () =>
 								handler(
 									event,
-									createHandlerContext(ctx, handlerSignal, event.type === "tool_call" ? budget : undefined),
+									createHandlerContext(
+										ctx,
+										handlerSignal,
+										event.type === "tool_call" || event.type === "tool_authorization" ? budget : undefined,
+									),
 								),
 							);
 						} catch (error) {
@@ -1532,9 +1536,10 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
+				const handlerEvent = { ...event, input: structuredClone(event.input) };
 				const handlerResult = (await this.#runHandlerWithTimeout(
 					handler,
-					event,
+					handlerEvent,
 					ctx,
 					ext,
 					timeoutMs,
@@ -1556,7 +1561,13 @@ export class ExtensionRunner {
 					};
 				}
 				if (handlerResult.decision === "deny") return handlerResult;
-				if (handlerResult.decision === "ask" || result === undefined) result = handlerResult;
+				if (handlerResult.decision === "ask") {
+					const previousReason = result?.decision === "ask" ? result.reason : undefined;
+					const reason = handlerResult.reason || previousReason;
+					result = { decision: "ask", ...(reason ? { reason } : {}) };
+				} else if (result === undefined) {
+					result = handlerResult;
+				}
 			}
 		}
 
