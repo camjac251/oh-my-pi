@@ -270,14 +270,20 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && (manualPromptRequired || !xdevBypass)),
 			reason: resolved.reason,
 		};
+		const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
+		const matchesScheduledCall =
+			scheduledCall?.id === toolCallId &&
+			(scheduledCall.name === this.tool.name || scheduledCall.name === this.tool.customWireName);
 		let extensionApprovalRequired = false;
 		if (hasFinalAuthorization) {
+			if (matchesScheduledCall) {
+				await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
+			}
 			const manualApprovalRequired = pendingSafetyChecks.length > 0 || manualPromptRequired;
-			const sessionId = context?.sessionManager?.getSessionId() ?? "";
 			const authorization = await this.runner.emitToolAuthorization(
 				{
 					type: "tool_authorization",
-					sessionId,
+					sessionId: this.runner.sessionId,
 					toolName: this.tool.name,
 					toolCallId,
 					input: normalizeToolEventInput(
@@ -306,11 +312,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		}
 
 		if (approvalCheck.required) {
-			const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
-			if (
-				scheduledCall?.id === toolCallId &&
-				(scheduledCall.name === this.tool.name || scheduledCall.name === this.tool.customWireName)
-			) {
+			if (matchesScheduledCall && !hasFinalAuthorization) {
 				await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
 			}
 

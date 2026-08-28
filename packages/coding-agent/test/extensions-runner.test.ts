@@ -3393,6 +3393,84 @@ describe("ExtensionRunner", () => {
 			delete globalState.__authorizationEvents;
 		});
 
+		it("waits for the scheduled-call preview before final authorization dialogs", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async (_event, ctx) => {
+						const approved = await ctx.ui.confirm("Protected write", "Allow this action?");
+						return approved ? { decision: "allow" } : { decision: "deny" };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-preview-order.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const order: string[] = [];
+			runner.setToolApprovalPreviewWaiter(async toolCallId => {
+				order.push(`preview:${toolCallId}`);
+			});
+			const confirm: ExtensionUIContext["confirm"] = async () => {
+				order.push("authorization-dialog");
+				return true;
+			};
+			initApprovalRunner(runner, async () => undefined, { confirm });
+			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+			const context = {
+				settings: { get: (key: string) => (key === "tools.approvalMode" ? "yolo" : {}) },
+				toolCall: {
+					batchId: "authorization-preview-batch",
+					index: 0,
+					total: 1,
+					toolCalls: [{ id: "call-authorization-preview", name: "dangerous_tool" }],
+				},
+			} as never;
+
+			await wrapped.execute("call-authorization-preview", {}, undefined, undefined, context);
+
+			expect(order).toEqual(["preview:call-authorization-preview", "authorization-dialog"]);
+		});
+
+		it("uses the runner session for final authorization without a context session manager", async () => {
+			const sessionIds: string[] = [];
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async (event) => {
+						globalThis.__authorizationSessionIds.push(event.sessionId);
+						return { decision: "allow" };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-session-id.ts"), extCode);
+			const globalState = globalThis as typeof globalThis & { __authorizationSessionIds?: string[] };
+			globalState.__authorizationSessionIds = sessionIds;
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+			const context = {
+				settings: { get: (key: string) => (key === "tools.approvalMode" ? "yolo" : {}) },
+			} as never;
+
+			await wrapped.execute("call-authorization-session", {}, undefined, undefined, context);
+
+			expect(sessionIds).toEqual([runner.sessionId]);
+			expect(sessionIds[0]).not.toBe("");
+			delete globalState.__authorizationSessionIds;
+		});
+
 		it("authorizes hashline edits against their canonical target paths without rewriting execution", async () => {
 			const extCode = `
 				export default function(pi) {
