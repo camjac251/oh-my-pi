@@ -16,6 +16,7 @@ import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/eve
 import { STREAMING_REVEAL_FRAME_MS } from "@oh-my-pi/pi-coding-agent/modes/controllers/streaming-reveal";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import * as titleGenerator from "@oh-my-pi/pi-coding-agent/utils/title-generator";
 import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
 
 beforeAll(async () => {
@@ -45,11 +46,18 @@ function makeStreamingMessage(content: AssistantMessage["content"]): AssistantMe
 function createFixture(streamingMessage: AssistantMessage, tool?: AgentTool) {
 	const pendingTools = new Map<string, ToolExecutionComponent>();
 	let approvalWaiter: ((toolCallId: string) => Promise<void>) | undefined;
+	let approvalAttentionHandler: ((toolCallId: string, active: boolean) => void) | undefined;
 	const extensionRunner = {
 		setToolApprovalPreviewWaiter(waiter: (toolCallId: string) => Promise<void>) {
 			approvalWaiter = waiter;
 			return () => {
 				if (approvalWaiter === waiter) approvalWaiter = undefined;
+			};
+		},
+		setToolApprovalAttentionHandler(handler: (toolCallId: string, active: boolean) => void) {
+			approvalAttentionHandler = handler;
+			return () => {
+				if (approvalAttentionHandler === handler) approvalAttentionHandler = undefined;
 			};
 		},
 	};
@@ -64,6 +72,7 @@ function createFixture(streamingMessage: AssistantMessage, tool?: AgentTool) {
 		controller: new EventController(ctx),
 		pendingTools,
 		getApprovalWaiter: () => approvalWaiter,
+		getApprovalAttentionHandler: () => approvalAttentionHandler,
 	};
 }
 
@@ -280,5 +289,36 @@ describe("EventController paces streamed tool args", () => {
 		await waiting;
 		const rendered = pendingTools.get("tc-approval")?.render(100).join("\n") ?? "";
 		expect(Bun.stripANSI(rendered)).toContain("ISSUE_7957_PROPOSED_EDIT");
+	});
+
+	it("shows terminal attention while an extension approval is waiting", async () => {
+		await Settings.init({ inMemory: true, cwd: process.cwd() });
+		const stateSpy = vi.spyOn(titleGenerator, "setTerminalTitleState").mockImplementation(() => {});
+		const streaming = makeStreamingMessage([]);
+		const { getApprovalAttentionHandler } = createFixture(streaming);
+		const attentionHandler = getApprovalAttentionHandler();
+		if (!attentionHandler) throw new Error("expected the TUI approval-attention handler");
+
+		attentionHandler("tc-extension-approval", true);
+		expect(stateSpy).toHaveBeenLastCalledWith("attention");
+
+		attentionHandler("tc-extension-approval", false);
+		expect(stateSpy).toHaveBeenLastCalledWith("working");
+	});
+
+	it("keeps attention when an Ask prompt outlives extension approval", async () => {
+		await Settings.init({ inMemory: true, cwd: process.cwd() });
+		const stateSpy = vi.spyOn(titleGenerator, "setTerminalTitleState").mockImplementation(() => {});
+		const streaming = makeStreamingMessage([]);
+		const { controller, getApprovalAttentionHandler } = createFixture(streaming);
+		const attentionHandler = getApprovalAttentionHandler();
+		if (!attentionHandler) throw new Error("expected the TUI approval-attention handler");
+
+		await dispatchToolStart(controller, { toolCallId: "tc-ask", toolName: "ask", args: {} });
+		stateSpy.mockClear();
+		attentionHandler("tc-ask", true);
+		attentionHandler("tc-ask", false);
+
+		expect(stateSpy).not.toHaveBeenCalledWith("working");
 	});
 });

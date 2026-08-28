@@ -369,7 +369,7 @@
 - Fixed `import numpy` (and other native-extension imports) hanging indefinitely in the Python eval tool on Windows, where the runner's always-on background stdin reader deadlocked native DLL loading; Windows now reads the control channel serially between requests while POSIX keeps concurrent request dispatch ([#7985](https://github.com/can1357/oh-my-pi/issues/7985)).
 ### Added
 
-- Added a final tool authorization extension event that receives rewritten execution input and composes allow, ask, or deny decisions with native approval.
+- Added a final tool authorization extension event that receives rewritten execution input and composes allow, ask, or deny decisions before TUI or ACP approval.
 
 ## [18.0.9] - 2026-08-28
 

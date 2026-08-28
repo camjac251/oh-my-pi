@@ -718,6 +718,9 @@ export class SessionTools {
 			const toolPolicy = userPolicies[tool.name];
 			if (!toolPolicy || toolPolicy === "allow") return tool;
 		}
+		if (tool instanceof ExtensionToolWrapper) {
+			return tool.wrapInnerTool(innerTool => this.#wrapToolForAcpPermission(innerTool)) as unknown as T;
+		}
 		return new Proxy(tool, {
 			get: (target, prop) => {
 				if (prop !== "execute") return target[prop as keyof T];

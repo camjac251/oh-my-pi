@@ -2934,7 +2934,7 @@ describe("ExtensionRunner", () => {
 		// Minimal runtime init so the approval gate's interactive `select` is wired for prompt-path tests.
 		const initApprovalRunner = (
 			runner: ExtensionRunner,
-			select: (title: string, options: string[]) => Promise<string | undefined>,
+			select: ExtensionUIContext["select"],
 			uiOverrides: Partial<ExtensionUIContext> = {},
 		) => {
 			runner.initialize(
@@ -3646,6 +3646,91 @@ describe("ExtensionRunner", () => {
 			await wrapped.execute("call-authorization-ask", {}, undefined, undefined, yoloContext);
 
 			expect(select).toHaveBeenCalledWith(expect.stringContaining("Protected external write"), ["Approve", "Deny"]);
+		});
+
+		it("signals attention while an extension-required approval is open", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async () => ({
+						decision: "ask",
+						reason: "Protected external write",
+					}));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-attention.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const attentionStates: Array<{ toolCallId: string; active: boolean }> = [];
+			runner.setToolApprovalAttentionHandler((toolCallId, active) => {
+				attentionStates.push({ toolCallId, active });
+			});
+			const select = vi.fn(async () => {
+				expect(attentionStates).toEqual([{ toolCallId: "call-authorization-attention", active: true }]);
+				return "Approve";
+			});
+			initApprovalRunner(runner, select);
+
+			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+			await wrapped.execute("call-authorization-attention", {}, undefined, undefined, yoloContext);
+
+			expect(attentionStates).toEqual([
+				{ toolCallId: "call-authorization-attention", active: true },
+				{ toolCallId: "call-authorization-attention", active: false },
+			]);
+		});
+
+		it("cancels an extension-required approval with the dispatch signal", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async () => ({
+						decision: "ask",
+						reason: "Protected external write",
+					}));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-cancellation.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const approvalOpened = Promise.withResolvers<void>();
+			const selection = Promise.withResolvers<string | undefined>();
+			const select: ExtensionUIContext["select"] = async (_title, _options, dialogOptions) => {
+				const approvalSignal = dialogOptions?.signal;
+				if (!approvalSignal) throw new Error("Expected the approval dispatch signal");
+				approvalSignal.addEventListener("abort", () => selection.reject(new Error("Approval aborted")), {
+					once: true,
+				});
+				approvalOpened.resolve();
+				return selection.promise;
+			};
+			initApprovalRunner(runner, select);
+
+			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+			const abortController = new AbortController();
+			const execution = wrapped.execute(
+				"call-authorization-cancellation",
+				{},
+				abortController.signal,
+				undefined,
+				yoloContext,
+			);
+			await approvalOpened.promise;
+			abortController.abort();
+
+			await expect(execution).rejects.toThrow("Approval aborted");
 		});
 
 		it("sanitizes and bounds extension reasons before rendering approval", async () => {

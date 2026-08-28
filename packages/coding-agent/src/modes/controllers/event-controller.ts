@@ -109,9 +109,11 @@ export class EventController {
 	/** Tool calls whose approval prompt drove the title into `attention`; cleared
 	 *  at their tool_execution_end so the title returns to `working`. */
 	#approvalAttentionToolCallIds = new Set<string>();
+	#extensionApprovalAttentionToolCallIds = new Set<string>();
 	#approvalPreviewGates = new Map<string, ApprovalPreviewGate>();
 	#pendingStreamPreviews = new Map<string, unknown>();
 	#detachToolApprovalPreviewWaiter: (() => void) | undefined;
+	#detachToolApprovalAttentionHandler: (() => void) | undefined;
 	#readToolCallArgs = new Map<string, Record<string, unknown>>();
 	#readToolCallAssistantComponents = new Map<string, AssistantMessageComponent>();
 	#toolTimelineComponents = new Map<string, Component>();
@@ -230,6 +232,10 @@ export class EventController {
 		this.#detachToolApprovalPreviewWaiter = session?.extensionRunner?.setToolApprovalPreviewWaiter(toolCallId =>
 			this.#waitForToolApprovalPreview(toolCallId),
 		);
+		this.#detachToolApprovalAttentionHandler = session?.extensionRunner?.setToolApprovalAttentionHandler(
+			(toolCallId, active) =>
+				this.#setToolApprovalAttention(this.#extensionApprovalAttentionToolCallIds, toolCallId, active),
+		);
 		vocalizer.setEnhancer(
 			session?.modelRegistry && session.agent && session.settings
 				? new SpeechEnhancer({
@@ -329,6 +335,8 @@ export class EventController {
 	dispose(): void {
 		this.#detachToolApprovalPreviewWaiter?.();
 		this.#detachToolApprovalPreviewWaiter = undefined;
+		this.#detachToolApprovalAttentionHandler?.();
+		this.#detachToolApprovalAttentionHandler = undefined;
 		this.#clearApprovalPreviewGates();
 		if (this.#messageUpdateTimer) {
 			clearTimeout(this.#messageUpdateTimer);
@@ -401,6 +409,21 @@ export class EventController {
 
 	async #waitForToolApprovalPreview(toolCallId: string): Promise<void> {
 		await this.#approvalPreviewGate(toolCallId).promise;
+	}
+
+	#setToolApprovalAttention(toolCallIds: Set<string>, toolCallId: string, active: boolean): void {
+		if (active) {
+			toolCallIds.add(toolCallId);
+			setTerminalTitleState("attention");
+			return;
+		}
+		if (
+			toolCallIds.delete(toolCallId) &&
+			this.#approvalAttentionToolCallIds.size === 0 &&
+			this.#extensionApprovalAttentionToolCallIds.size === 0
+		) {
+			setTerminalTitleState("working");
+		}
 	}
 
 	#startToolApprovalPreview(toolCallId: string): void {
@@ -735,6 +758,7 @@ export class EventController {
 		this.#postToolAssistantComponents.clear();
 		this.#backgroundTaskCallIds.clear();
 		this.#approvalAttentionToolCallIds.clear();
+		this.#extensionApprovalAttentionToolCallIds.clear();
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#lastAssistantComponent = undefined;
@@ -1535,8 +1559,7 @@ export class EventController {
 		const tool = this.ctx.viewSession.getToolByName(event.toolName);
 		const renderToolName = toolRenderName(event.toolName, tool);
 		if (renderToolName === "ask" || this.#toolWillPromptForApproval(renderToolName, event.args)) {
-			this.#approvalAttentionToolCallIds.add(event.toolCallId);
-			setTerminalTitleState("attention");
+			this.#setToolApprovalAttention(this.#approvalAttentionToolCallIds, event.toolCallId, true);
 		}
 		this.#resolveDisplaceablePoll(renderToolName);
 		if (!this.ctx.pendingTools.has(event.toolCallId)) {
@@ -1739,12 +1762,7 @@ export class EventController {
 		// to finish must not clear the attention signal while another prompt still
 		// waits. `ask` ids are in the set too (added at tool_execution_start), so
 		// the delete also covers them without leaking ids until turn end.
-		if (
-			this.#approvalAttentionToolCallIds.delete(event.toolCallId) &&
-			this.#approvalAttentionToolCallIds.size === 0
-		) {
-			setTerminalTitleState("working");
-		}
+		this.#setToolApprovalAttention(this.#approvalAttentionToolCallIds, event.toolCallId, false);
 		if (event.toolName === "read") {
 			if (this.#inlineReadToolImages(event.toolCallId, event.result)) {
 				const component = this.ctx.pendingTools.get(event.toolCallId);
@@ -1945,6 +1963,7 @@ export class EventController {
 		await this.ctx.flushPendingModelSwitch();
 		this.#sealAbandonedForegroundTools();
 		this.#approvalAttentionToolCallIds.clear();
+		this.#extensionApprovalAttentionToolCallIds.clear();
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#priorTurnToolComponents = new Map(this.#toolTimelineComponents);

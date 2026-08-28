@@ -13,6 +13,10 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { type SettingPath, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import type { Extension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type {
 	ClientBridge,
@@ -23,6 +27,7 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { dispatchXdevTool, resolveMountedXdevExecutable, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 // ---------------------------------------------------------------------------
@@ -87,6 +92,7 @@ async function createSession(
 		xdev?: XdevState;
 		builtInToolNames?: string[];
 		persist?: boolean;
+		extension?: { runtime: ExtensionRuntime; value: Extension };
 	},
 ): Promise<AgentSession> {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -96,13 +102,26 @@ async function createSession(
 	const sessionManager = options?.persist
 		? SessionManager.create(tempDir.path(), `${tempDir.path()}/sessions`)
 		: SessionManager.inMemory(tempDir.path());
+	const modelRegistry = {} as never;
+	const extensionRunner = options?.extension
+		? new ExtensionRunner(
+				[options.extension.value],
+				options.extension.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+				undefined,
+				settings,
+			)
+		: undefined;
+	const runtimeTools = extensionRunner ? tools.map(tool => new ExtensionToolWrapper(tool, extensionRunner)) : tools;
 
 	const agent = new Agent({
 		getApiKey: () => "test-key",
 		initialState: {
 			model,
 			systemPrompt: ["Test"],
-			tools,
+			tools: runtimeTools,
 			messages: [],
 		},
 		convertToLlm,
@@ -110,15 +129,16 @@ async function createSession(
 	});
 
 	const toolRegistry = options?.xdev?.tools ?? new Map<string, AgentTool>();
-	for (const tool of tools) toolRegistry.set(tool.name, tool);
+	for (const tool of runtimeTools) toolRegistry.set(tool.name, tool);
 	const sess = new AgentSession({
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: {} as never,
+		modelRegistry,
 		toolRegistry,
 		xdev: options?.xdev,
 		builtInToolNames: options?.builtInToolNames,
+		extensionRunner,
 	});
 
 	if (bridge) sess.setClientBridge(bridge);
@@ -187,6 +207,38 @@ it("allow_once: calls bridge once and executes the underlying tool", async () =>
 
 	expect(permissionSpy).toHaveBeenCalledTimes(1);
 	expect(bashTool.executeCalls).toBe(1);
+});
+
+it("extension denial runs before an ACP permission request", async () => {
+	const bashTool = makeFakeTool("bash");
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	const runtime = new ExtensionRuntime();
+	const extension = await loadExtensionFromFactory(
+		pi => {
+			pi.on("tool_authorization", () => ({ decision: "deny", reason: "Blocked before ACP permission" }));
+		},
+		tempDir.path(),
+		new EventBus(),
+		runtime,
+		"acp-final-authorization-order",
+	);
+	session = await createSession([bashTool], bridge, {}, { extension: { runtime, value: extension } });
+
+	await session.setActiveToolsByName(["bash"]);
+	const wrappedBash = session.agent.state.tools.find(tool => tool.name === "bash");
+
+	await expect(
+		wrappedBash!.execute(
+			"call-extension-deny",
+			{ command: "echo hi" },
+			undefined,
+			undefined as never,
+			undefined as never,
+		),
+	).rejects.toThrow("Blocked before ACP permission");
+	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(bashTool.executeCalls).toBe(0);
 });
 
 it("eval bridge dispatch uses the same ACP gate as a direct tool call", async () => {
