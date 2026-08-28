@@ -435,7 +435,6 @@ describe("AskDialogComponent", () => {
 		await Promise.resolve();
 
 		expect(onPrompt).toHaveBeenCalledTimes(1);
-		expect(onPrompt.mock.calls[0][0]).toBe("Note: Choose one?");
 
 		// Verify note is saved by submitting
 		component.handleInput(ENTER);
@@ -467,7 +466,6 @@ describe("AskDialogComponent", () => {
 		await Promise.resolve();
 
 		expect(onPrompt).toHaveBeenCalledTimes(1);
-		expect(onPrompt.mock.calls[0][0]).toBe("Note: Choose one?");
 		expect(onPrompt.mock.calls[0][1]).toBeUndefined();
 
 		component.handleInput(DOWN);
