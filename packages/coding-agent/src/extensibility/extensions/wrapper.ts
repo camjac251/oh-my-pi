@@ -377,6 +377,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				};
 			} else if (authorization?.decision === "allow" && !manualApprovalRequired) {
 				approvalCheck = { required: false, reason: approvalCheck.reason };
+				if (nativeApprovalRequired) {
+					this.runner.reportToolApprovalAttention(toolCallId, false, "native");
+				}
 			}
 		}
 
@@ -449,7 +452,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					: basePrompt;
 			let choice: string | undefined;
 			const extensionOnlyApproval = extensionApprovalRequired && !nativeApprovalRequired;
-			if (extensionOnlyApproval) this.runner.reportToolApprovalAttention(toolCallId, true);
+			if (extensionOnlyApproval) this.runner.reportToolApprovalAttention(toolCallId, true, "extension");
 			try {
 				choice = signal
 					? await uiContext.select(safetyPrompt, ["Approve", "Deny"], { signal })
@@ -459,7 +462,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				cancelPreflight();
 				throw err;
 			} finally {
-				if (extensionOnlyApproval) this.runner.reportToolApprovalAttention(toolCallId, false);
+				if (extensionOnlyApproval) this.runner.reportToolApprovalAttention(toolCallId, false, "extension");
 			}
 			const approved = choice === "Approve";
 			await emitApprovalResolved(approved, approved ? undefined : "denied by user");
