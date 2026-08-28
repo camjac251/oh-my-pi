@@ -187,13 +187,28 @@ function createHandlerUIContext(
 	ui: ExtensionUIContext,
 	handlerSignal: AbortSignal,
 	timeoutBudget?: HandlerTimeoutBudget,
+	dialogAttention?: (active: boolean) => void,
 ): ExtensionUIContext {
 	const askDialog = ui.askDialog;
+	let dialogDepth = 0;
+	const setDialogAttention = (active: boolean): void => {
+		if (!dialogAttention) return;
+		if (active) {
+			dialogDepth++;
+			if (dialogDepth === 1) dialogAttention(true);
+			return;
+		}
+		if (dialogDepth === 0) return;
+		dialogDepth--;
+		if (dialogDepth === 0) dialogAttention(false);
+	};
 	const runDialog = async <T>(dialog: () => Promise<T>): Promise<T> => {
 		timeoutBudget?.pause();
+		setDialogAttention(true);
 		try {
 			return await dialog();
 		} finally {
+			setDialogAttention(false);
 			timeoutBudget?.resume();
 		}
 	};
@@ -217,6 +232,7 @@ function createHandlerUIContext(
 						const component = await factory(...args);
 						if (!customSettled) {
 							timeoutBudget?.pause();
+							setDialogAttention(true);
 							componentReady = true;
 						}
 						return component;
@@ -228,7 +244,10 @@ function createHandlerUIContext(
 				);
 			} finally {
 				customSettled = true;
-				if (componentReady) timeoutBudget?.resume();
+				if (componentReady) {
+					setDialogAttention(false);
+					timeoutBudget?.resume();
+				}
 			}
 		},
 		editor: (title, prefill, dialogOptions, editorOptions) =>
@@ -262,10 +281,11 @@ function createHandlerContext(
 	ctx: ExtensionContext,
 	handlerSignal: AbortSignal,
 	timeoutBudget?: HandlerTimeoutBudget,
+	dialogAttention?: (active: boolean) => void,
 ): ExtensionContext {
 	const scoped: ExtensionContext = Object.create(ctx);
 	Object.defineProperty(scoped, "ui", {
-		value: createHandlerUIContext(ctx.ui, handlerSignal, timeoutBudget),
+		value: createHandlerUIContext(ctx.ui, handlerSignal, timeoutBudget, dialogAttention),
 		enumerable: true,
 		configurable: true,
 	});
@@ -1512,6 +1532,10 @@ export class ExtensionRunner {
 		const signal = signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
 		if (signal?.aborted) return undefined;
 		const registrationScope: ToolRegistrationScope = { pending: new Set(), closed: false };
+		const authorizationToolCallId =
+			event.type === "tool_authorization" && "toolCallId" in event && typeof event.toolCallId === "string"
+				? event.toolCallId
+				: undefined;
 		let handlerResult: R | typeof EXTENSION_HANDLER_TIMEOUT | typeof EXTENSION_HANDLER_ABORTED | undefined;
 		let handlerFailure: { error: unknown } | undefined;
 		try {
@@ -1524,7 +1548,10 @@ export class ExtensionRunner {
 							const handlerContext = createHandlerContext(
 								ctx,
 								handlerSignal,
- 								event.type === "tool_call" || event.type === "tool_authorization" ? budget : undefined,
+								event.type === "tool_call" || event.type === "tool_authorization" ? budget : undefined,
+								authorizationToolCallId
+									? active => this.reportToolApprovalAttention(authorizationToolCallId, active, "extension")
+									: undefined,
 							);
 							result = await this.#toolRegistrationScope.run(registrationScope, () =>
 								handler(event, handlerContext),

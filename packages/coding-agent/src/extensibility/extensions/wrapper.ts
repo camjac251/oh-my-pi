@@ -12,6 +12,7 @@ import {
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import { sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import { withApprovedAcpToolCall } from "../../session/acp-permission-gate";
 import {
 	denyError,
 	formatApprovalPrompt,
@@ -344,6 +345,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			scheduledCall?.id === toolCallId &&
 			(scheduledCall.name === this.tool.name || scheduledCall.name === this.tool.customWireName);
 		let extensionApprovalRequired = false;
+		let extensionApprovalGranted = false;
 		if (hasFinalAuthorization) {
 			if (matchesScheduledCall) {
 				await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
@@ -470,6 +472,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				cancelPreflight();
 				throw new Error(`Tool call denied by user: ${this.tool.name}`);
 			}
+			if (extensionApprovalRequired) extensionApprovalGranted = true;
 			if (pendingSafetyChecks.length > 0) {
 				if (!context) {
 					cancelPreflight();
@@ -488,9 +491,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			// expose its settings to registered tools and any fallback handlers they
 			// trigger. `sdk.ts` wraps the whole tool registry with this class whenever
 			// a runner exists.
+			const executeTool = () => this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context);
 			result = await this.runner.runScoped(() =>
 				withFileMutationSession(this.runner.sessionId, () =>
-					this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context),
+					extensionApprovalGranted ? withApprovedAcpToolCall(toolCallId, executeTool) : executeTool(),
 				),
 			);
 		} catch (err) {

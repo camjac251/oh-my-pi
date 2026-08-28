@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { editInspect } from "@oh-my-pi/pi-natives";
 import { isRecord, stringProperty } from "@oh-my-pi/pi-utils";
 import { resolveToCwd } from "../tools/path-utils";
@@ -21,6 +22,16 @@ export const PERMISSION_OPTIONS: ClientBridgePermissionOption[] = [
 
 /** Permission options indexed by their wire identifiers; unknown IDs miss and fail closed. */
 export const PERMISSION_OPTIONS_BY_ID = new Map(PERMISSION_OPTIONS.map(option => [option.optionId, option]));
+
+const approvedToolCall = new AsyncLocalStorage<string>();
+
+export function withApprovedAcpToolCall<T>(toolCallId: string, execute: () => Promise<T>): Promise<T> {
+	return approvedToolCall.run(toolCallId, execute);
+}
+
+export function isApprovedAcpToolCall(toolCallId: string): boolean {
+	return approvedToolCall.getStore() === toolCallId;
+}
 
 function getEditDestructiveIntent(args: unknown): { kind: "delete" | "move"; paths: string[] } | undefined {
 	if (!isRecord(args)) return undefined;
