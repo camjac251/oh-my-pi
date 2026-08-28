@@ -20,7 +20,7 @@ import {
 import { type ApprovalMode, denyError, formatApprovalPrompt, resolveApproval } from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
-import { TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
+import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
@@ -129,11 +129,16 @@ function toolEventArgs(params: unknown, context: AgentToolContext | undefined): 
 	return params as Record<string, unknown>;
 }
 
+function approvalText(value: string): string {
+	return shortenPath(
+		sanitizeText(value)
+			.replace(/[\r\n\t]+/g, " ")
+			.trim(),
+	);
+}
+
 function approvalData(value: string): string {
-	const sanitized = sanitizeText(value)
-		.replace(/[\r\n\t]+/g, " ")
-		.trim();
-	const truncated = truncateToWidth(sanitized, TRUNCATE_LENGTHS.CONTENT);
+	const truncated = truncateToWidth(approvalText(value), TRUNCATE_LENGTHS.CONTENT);
 	return truncated.replace(/([\\`*_{}[\]()<>#+\-.!|])/g, "\\$1");
 }
 
@@ -339,7 +344,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 
 			const hasApprovalHandlers =
 				this.runner.hasHandlers("tool_approval_requested") || this.runner.hasHandlers("tool_approval_resolved");
-			const sessionId = context?.sessionManager?.getSessionId() ?? "";
+			const sessionId = this.runner.sessionId;
 			if (hasApprovalHandlers) {
 				await this.runner.emit({
 					type: "tool_approval_requested",
@@ -431,9 +436,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			const executeTool = () => this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context);
 			result = await this.runner.runScoped(() =>
 				withFileMutationSession(this.runner.sessionId, () => {
-					if (extensionApprovalGranted) return withApprovedAcpToolCall(toolCallId, executeTool);
+					if (extensionApprovalGranted)
+						return withApprovedAcpToolCall(toolCallId, this.tool.name, executeTool);
 					if (deferExtensionApprovalToAcp)
-						return withRequiredAcpApproval(toolCallId, approvalReason, executeTool);
+						return withRequiredAcpApproval(toolCallId, this.tool.name, approvalReason, executeTool);
 					return executeTool();
 				}),
 			);

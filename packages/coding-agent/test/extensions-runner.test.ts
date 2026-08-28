@@ -2563,7 +2563,7 @@ describe("ExtensionRunner", () => {
 			]);
 			delete globalState.__thrownApprovalEvents;
 		});
-		it("emits lifecycle events when partial context has no session manager", async () => {
+		it("uses the runner session for lifecycle events when context has no session manager", async () => {
 			const events: Array<{ type: string; approved?: boolean; reason?: string; sessionId?: string }> = [];
 			const extCode = `
 				export default function(pi) {
@@ -2605,10 +2605,10 @@ describe("ExtensionRunner", () => {
 			).rejects.toThrow('Tool "dangerous_tool" requires approval but no interactive UI available.');
 
 			expect(events).toEqual([
-				{ type: "tool_approval_requested", sessionId: "", reason: undefined },
+				{ type: "tool_approval_requested", sessionId: sessionManager.getSessionId(), reason: undefined },
 				{
 					type: "tool_approval_resolved",
-					sessionId: "",
+					sessionId: sessionManager.getSessionId(),
 					approved: false,
 					reason: "no interactive UI available",
 				},
@@ -3943,6 +3943,47 @@ describe("ExtensionRunner", () => {
 			await expect(
 				wrapped.execute("call-authorization-deny", {}, undefined, undefined, yoloContext),
 			).rejects.toThrow("Blocked by final policy");
+		});
+
+		it("sanitizes and bounds final authorization denial reasons", async () => {
+			const unsafeReason = `${homedir()}/secrets\tred\n\u001b[31m${"界".repeat(200)}`;
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async () => ({
+						decision: "deny",
+						reason: ${JSON.stringify(unsafeReason)},
+					}));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-sanitized-deny.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+
+			let thrown: Error | undefined;
+			try {
+				await wrapped.execute("call-authorization-sanitized-deny", {}, undefined, undefined, yoloContext);
+			} catch (error) {
+				if (!(error instanceof Error)) throw error;
+				thrown = error;
+			}
+
+			const message = thrown?.message ?? "";
+			expect(thrown).toBeDefined();
+			expect(message).toContain("~/secrets red");
+			expect(message).not.toContain(homedir());
+			expect(message).not.toContain("\t");
+			expect(message).not.toContain("\n");
+			expect(message).not.toContain("\u001b");
+			expect(message).toContain("…");
+			expect(visibleWidth(message)).toBeLessThanOrEqual(TRUNCATE_LENGTHS.CONTENT);
 		});
 
 		it("denies execution when a final authorization handler fails", async () => {

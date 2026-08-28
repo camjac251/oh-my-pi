@@ -11,7 +11,7 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import type { CredentialDisabledEvent, ImageContent, Model, ProviderResponseMetadata } from "@oh-my-pi/pi-ai";
 import type { KeyId } from "@oh-my-pi/pi-tui";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../../config/model-registry";
 import { type Settings, withActiveSettings } from "../../config/settings";
 import type { LocalProtocolOptions } from "../../internal-urls/local-protocol";
@@ -20,7 +20,7 @@ import { type Theme, theme } from "../../modes/theme/theme";
 import type { AsyncJobSnapshot } from "../../session/agent-session";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
-import { shortenPath } from "../../tools/render-utils";
+import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
@@ -99,6 +99,15 @@ export function testSetExtensionHandlerTimeoutMs(timeoutMs: number): void {
 
 function normalizeHandlerTimeout(timeoutMs: number): number {
 	return Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : EXTENSION_HANDLER_TIMEOUT_MS;
+}
+
+function authorizationReason(value: string): string {
+	const sanitized = shortenPath(
+		sanitizeText(value)
+			.replace(/[\r\n\t]+/g, " ")
+			.trim(),
+	);
+	return truncateToWidth(sanitized, TRUNCATE_LENGTHS.CONTENT);
 }
 
 /**
@@ -1581,19 +1590,23 @@ export class ExtensionRunner {
 
 			for (const handler of handlers) {
 				const handlerEvent = { ...event, input: structuredClone(event.input) };
+				let handlerFailed = false;
 				const handlerResult = (await this.#runHandlerWithTimeout(
 					handler,
 					handlerEvent,
 					ctx,
 					ext,
 					timeoutMs,
-					(kind, message) => ({
-						decision: "deny" as const,
-						reason:
-							kind === "timeout"
-								? `Extension ${extensionPath} timed out after ${timeoutMs}ms`
-								: `Extension ${extensionPath} failed: ${message}`,
-					}),
+					(kind, message) => {
+						handlerFailed = true;
+						return {
+							decision: "deny" as const,
+							reason:
+								kind === "timeout"
+									? `Extension ${extensionPath} timed out after ${timeoutMs}ms`
+									: `Extension ${extensionPath} failed: ${message}`,
+						};
+					},
 					signal,
 				)) as ToolAuthorizationEventResult | undefined;
 
@@ -1604,7 +1617,10 @@ export class ExtensionRunner {
 						reason: `Extension ${extensionPath} returned an unsupported tool authorization decision`,
 					};
 				}
-				if (handlerResult.decision === "deny") return handlerResult;
+				if (handlerResult.decision === "deny") {
+					if (handlerFailed || !handlerResult.reason) return handlerResult;
+					return { ...handlerResult, reason: authorizationReason(handlerResult.reason) };
+				}
 				if (handlerResult.decision === "ask") {
 					const previousReason = result?.decision === "ask" ? result.reason : undefined;
 					const reason = handlerResult.reason || previousReason;

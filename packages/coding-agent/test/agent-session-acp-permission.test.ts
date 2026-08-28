@@ -479,6 +479,78 @@ it("extension approval with form elicitation avoids a second ACP permission requ
 	expect(bashTool.executeCalls).toBe(1);
 });
 
+it("extension approval does not approve a nested tool that reuses the call ID", async () => {
+	const deleteTool = makeFakeTool("delete");
+	deleteTool.loadMode = "discoverable";
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	const runtime = new ExtensionRuntime();
+	const extension = await loadExtensionFromFactory(
+		pi => {
+			pi.on("tool_authorization", event =>
+				event.toolName === "write" ? { decision: "ask", reason: "Confirm outer write" } : { decision: "allow" },
+			);
+		},
+		tempDir.path(),
+		new EventBus(),
+		runtime,
+		"acp-final-authorization-tool-scope",
+	);
+	let xdev: XdevState;
+	let writeExecuteCalls = 0;
+	const writeTool: AgentTool = {
+		name: "write",
+		label: "write",
+		description: "Fake write",
+		parameters: type({}),
+		async execute(toolCallId) {
+			writeExecuteCalls++;
+			const dispatched = await dispatchXdevTool(
+				xdev,
+				"delete",
+				JSON.stringify({ path: "/tmp/gone.ts" }),
+				toolCallId,
+			);
+			return dispatched.result;
+		},
+	};
+	const tools = new Map([writeTool, deleteTool].map(tool => [tool.name, tool]));
+	xdev = {
+		tools,
+		mountedNames: new Set(["delete"]),
+		builtInNames: new Set(["write"]),
+		isActive: name => name === "write",
+	};
+	session = await createSession(
+		[writeTool, deleteTool],
+		bridge,
+		{},
+		{ xdev, builtInToolNames: ["write"], extension: { runtime, value: extension } },
+	);
+	let selectCalls = 0;
+	if (!session.extensionRunner) throw new Error("expected extension runner");
+	initializeExtensionApprovalUI(session.extensionRunner, async () => {
+		selectCalls++;
+		return "Approve";
+	});
+
+	const wrappedWrite = session.agent.state.tools.find(tool => tool.name === "write");
+	await wrappedWrite!.execute(
+		"call-reused-acp-id",
+		{ path: "/tmp/outer.ts" },
+		undefined,
+		undefined as never,
+		{ hasUI: true } as never,
+	);
+
+	expect({
+		selectCalls,
+		permissionCalls: permissionSpy.mock.calls.length,
+		writeExecuteCalls,
+		deleteExecuteCalls: deleteTool.executeCalls,
+	}).toEqual({ selectCalls: 1, permissionCalls: 1, writeExecuteCalls: 1, deleteExecuteCalls: 1 });
+});
+
 it("extension ask without form elicitation does not bypass ordinary edit calls", async () => {
 	const editTool = makeFakeTool("edit");
 	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });

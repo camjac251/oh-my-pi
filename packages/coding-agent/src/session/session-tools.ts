@@ -751,7 +751,7 @@ export class SessionTools {
 					const commandContent = command
 						? [{ type: "content" as const, content: { type: "text" as const, text: `$ ${command}` } }]
 						: undefined;
-					const freshApprovalRequired = requiresFreshAcpApproval(toolCallId);
+					const freshApprovalRequired = requiresFreshAcpApproval(toolCallId, target.name);
 					if (permissionOnlyWhenRequired && !freshApprovalRequired) {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
@@ -760,7 +760,7 @@ export class SessionTools {
 					if (persisted === "reject_always") {
 						throw new ToolError(`Tool call rejected by user (preference)`);
 					}
-					if (isApprovedAcpToolCall(toolCallId)) {
+					if (isApprovedAcpToolCall(toolCallId, target.name)) {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
 					if (persisted === "allow_always" && !freshApprovalRequired) {
@@ -777,7 +777,7 @@ export class SessionTools {
 					signal?.addEventListener("abort", onAbort, { once: true });
 					let raced: PermissionRaceResult;
 					try {
-						const requiredApprovalReason = getRequiredAcpApprovalReason(toolCallId);
+						const requiredApprovalReason = getRequiredAcpApprovalReason(toolCallId, target.name);
 						const permissionContent = [
 							...(requiredApprovalReason
 								? [
