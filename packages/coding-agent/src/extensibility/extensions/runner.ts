@@ -20,6 +20,7 @@ import { type Theme, theme } from "../../modes/theme/theme";
 import type { AsyncJobSnapshot } from "../../session/agent-session";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
+import { shortenPath } from "../../tools/render-utils";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
@@ -1576,6 +1577,7 @@ export class ExtensionRunner {
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get("tool_authorization");
 			if (!handlers || handlers.length === 0) continue;
+			const extensionPath = shortenPath(ext.path);
 
 			for (const handler of handlers) {
 				const handlerEvent = { ...event, input: structuredClone(event.input) };
@@ -1589,8 +1591,8 @@ export class ExtensionRunner {
 						decision: "deny" as const,
 						reason:
 							kind === "timeout"
-								? `Extension ${ext.path} timed out after ${timeoutMs}ms`
-								: `Extension ${ext.path} failed: ${message}`,
+								? `Extension ${extensionPath} timed out after ${timeoutMs}ms`
+								: `Extension ${extensionPath} failed: ${message}`,
 					}),
 					signal,
 				)) as ToolAuthorizationEventResult | undefined;
@@ -1599,7 +1601,7 @@ export class ExtensionRunner {
 				if (!(["allow", "ask", "deny"] as const).includes(handlerResult.decision)) {
 					return {
 						decision: "deny",
-						reason: `Extension ${ext.path} returned an unsupported tool authorization decision`,
+						reason: `Extension ${extensionPath} returned an unsupported tool authorization decision`,
 					};
 				}
 				if (handlerResult.decision === "deny") return handlerResult;

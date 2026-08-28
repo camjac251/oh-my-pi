@@ -303,6 +303,49 @@ it("extension ask uses one ACP permission request without form elicitation", asy
 	expect(bashTool.executeCalls).toBe(1);
 });
 
+it("extension ask requires fresh ACP permission after a persisted allow", async () => {
+	const bashTool = makeFakeTool("bash");
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_always", kind: "allow_always" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	const runtime = new ExtensionRuntime();
+	let authorizationCalls = 0;
+	const extension = await loadExtensionFromFactory(
+		pi => {
+			pi.on("tool_authorization", () => {
+				authorizationCalls++;
+				return authorizationCalls === 1
+					? { decision: "allow" }
+					: { decision: "ask", reason: "Confirm protected command again" };
+			});
+		},
+		tempDir.path(),
+		new EventBus(),
+		runtime,
+		"acp-final-authorization-fresh-approval",
+	);
+	session = await createSession([bashTool], bridge, {}, { extension: { runtime, value: extension } });
+
+	await session.setActiveToolsByName(["bash"]);
+	const wrappedBash = session.agent.state.tools.find(tool => tool.name === "bash");
+	await wrappedBash!.execute(
+		"call-persist-allow",
+		{ command: "echo first" },
+		undefined,
+		undefined as never,
+		{ hasUI: false } as never,
+	);
+	await wrappedBash!.execute(
+		"call-extension-ask-after-allow",
+		{ command: "echo second" },
+		undefined,
+		undefined as never,
+		{ hasUI: false } as never,
+	);
+
+	expect(permissionSpy).toHaveBeenCalledTimes(2);
+	expect(bashTool.executeCalls).toBe(2);
+});
+
 it("extension approval with form elicitation avoids a second ACP permission request", async () => {
 	const bashTool = makeFakeTool("bash");
 	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });

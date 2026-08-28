@@ -4,6 +4,7 @@
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, expectTypeOf, it, vi } from "bun:test";
 import * as fs from "node:fs";
+import { homedir } from "node:os";
 import * as path from "node:path";
 import { Type } from "@oh-my-pi/omptype/typebox";
 import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
@@ -3955,6 +3956,7 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-failure.ts"), extCode);
 
 			const result = await loadTestExtensions();
+			result.extensions[0]!.path = path.join(homedir(), ".omp", "extensions", "tool-authorization-failure.ts");
 			const runner = new ExtensionRunner(
 				result.extensions,
 				result.runtime,
@@ -3966,7 +3968,7 @@ describe("ExtensionRunner", () => {
 
 			await expect(
 				wrapped.execute("call-authorization-failure", {}, undefined, undefined, yoloContext),
-			).rejects.toThrow("authorization failed");
+			).rejects.toThrow("Extension ~/.omp/extensions/tool-authorization-failure.ts failed: authorization failed");
 		});
 
 		it("denies execution when a final authorization handler times out", async () => {

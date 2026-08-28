@@ -34,6 +34,7 @@ import {
 	PERMISSION_OPTIONS,
 	PERMISSION_OPTIONS_BY_ID,
 	PERMISSION_REQUIRED_TOOLS,
+	requiresFreshAcpApproval,
 } from "./acp-permission-gate";
 import type { ClientBridge, ClientBridgePermissionOutcome } from "./client-bridge";
 import { buildToolNamespacesInfo, resolveCodeMode, type ToolNamespacesInfo } from "./code-mode";
@@ -745,13 +746,13 @@ export class SessionTools {
 						: undefined;
 					// Short-circuit on persisted decisions.
 					const persisted = this.#acpPermissionDecisions.get(permissionIntent.cacheKey);
-					if (persisted === "allow_always") {
-						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
-					}
 					if (persisted === "reject_always") {
 						throw new ToolError(`Tool call rejected by user (preference)`);
 					}
 					if (isApprovedAcpToolCall(toolCallId)) {
+						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
+					}
+					if (persisted === "allow_always" && !requiresFreshAcpApproval(toolCallId)) {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
 					if (signal?.aborted) {
