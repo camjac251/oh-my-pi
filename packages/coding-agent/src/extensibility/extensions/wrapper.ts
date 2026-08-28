@@ -280,7 +280,10 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					sessionId,
 					toolName: this.tool.name,
 					toolCallId,
-					input: toolEventArgs(effectiveParams, context),
+					input: normalizeToolEventInput(
+						this.tool.name,
+						resolveToolEventInput(this.tool, toolEventArgs(effectiveParams, context)),
+					),
 					approvalMode,
 					nativeDecision: approvalCheck.required ? "ask" : "allow",
 					manualApprovalRequired,
@@ -363,7 +366,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 
 			const uiContext = this.runner.getUIContext();
-			const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
+			const approvalReason =
+				extensionApprovalRequired && approvalCheck.reason
+					? approvalData(approvalCheck.reason)
+					: approvalCheck.reason;
+			const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalReason);
 			const safetyPrompt =
 				pendingSafetyChecks.length > 0
 					? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`

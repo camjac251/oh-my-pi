@@ -391,6 +391,9 @@
 - Kept embedded context usage visible in the status line when long session names or paths consume available space.
 - Added a status message when `CTRL-O` toggles tool-output expansion.
 - Fixed `omp usage` to report Codex Chat and Spark capacity meters separately when they share a usage window.
+### Added
+
+- Added a final tool authorization extension event that receives rewritten execution input and composes allow, ask, or deny decisions with native approval.
 
 ## [18.0.8] - 2026-08-27
 
@@ -399,8 +402,6 @@
 - Transcript usage rows now show the total prompt-to-yield time (Δ + clock, including tool calls) after the turn timestamp, opt-in via `display.showTurnTime` (off by default).
 - `omp usage` now shows Z.AI GLM Coding Plan credit quotas (5h + weekly) with the subscribed plan tier.
 - The usage status line now labels untiered quota windows with the report's plan tier, surfacing Z.AI Coding Plan (`pro`) and Codex plan names next to the 5h/7d percentages.
-- Added a final tool authorization extension event that receives rewritten execution input and composes allow, ask, or deny decisions with native approval.
-
 ### Fixed
 
 - Fixed corrupt session headers silently overwriting recoverable transcripts during resume ([#9915](https://github.com/can1357/oh-my-pi/issues/9915)).

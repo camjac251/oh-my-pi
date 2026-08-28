@@ -3393,6 +3393,49 @@ describe("ExtensionRunner", () => {
 			delete globalState.__authorizationEvents;
 		});
 
+		it("authorizes hashline edits against their canonical target paths without rewriting execution", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async (event) => {
+						if (event.toolName !== "edit") return;
+						const allowed = event.input.path === "plans/allowed.md"
+							&& Array.isArray(event.input.paths)
+							&& event.input.paths.length === 1
+							&& event.input.paths[0] === "plans/allowed.md";
+						return allowed
+							? { decision: "allow" }
+							: { decision: "deny", reason: "Missing canonical edit target" };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-hashline-path.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const executed: unknown[] = [];
+			const tool = {
+				...createHashlineEditTool(),
+				execute: async (_id: string, params: unknown) => {
+					executed.push(params);
+					return { content: [{ type: "text" as const, text: "ok" }] };
+				},
+			} as AgentTool;
+			const wrapped = new ExtensionToolWrapper(tool, runner);
+			const input = {
+				input: "¶plans/allowed.md#ABC1\n27 27\n+new content",
+			};
+
+			await wrapped.execute("call-authorization-hashline-path", input);
+
+			expect(executed).toEqual([input]);
+		});
+
 		it("isolates authorization input mutations from execution and later handlers", async () => {
 			const observedCommands: unknown[] = [];
 			const extCode = `
@@ -3525,6 +3568,40 @@ describe("ExtensionRunner", () => {
 			await wrapped.execute("call-authorization-ask", {}, undefined, undefined, yoloContext);
 
 			expect(select).toHaveBeenCalledWith(expect.stringContaining("Protected external write"), ["Approve", "Deny"]);
+		});
+
+		it("sanitizes and bounds extension reasons before rendering approval", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async () => ({
+						decision: "ask",
+						reason: "Protected\\twrite\\n\\u001b[31mred\\u001b[0m" + "x".repeat(700),
+					}));
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-sanitized-reason.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const select = vi.fn(async (_title: string, _options: string[]) => "Approve");
+			initApprovalRunner(runner, select);
+
+			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+			await wrapped.execute("call-authorization-sanitized-reason", {}, undefined, undefined, yoloContext);
+
+			const prompt = select.mock.calls[0]?.[0];
+			const reasonLine = prompt?.split("\n").find(line => line.startsWith("Reason: "));
+			expect(reasonLine).toContain("Protected write red");
+			expect(reasonLine).not.toContain("\t");
+			expect(reasonLine).not.toContain("\u001b");
+			expect(reasonLine).toContain("elided");
+			expect(reasonLine?.length).toBeLessThan(550);
 		});
 
 		it("explains extension-required approval when no interactive UI is available", async () => {
