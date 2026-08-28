@@ -6,6 +6,7 @@ import { formatDuration, logger, prompt, sanitizeText } from "@oh-my-pi/pi-utils
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { extractTextContent } from "../../commit/utils";
 import { settings } from "../../config/settings";
+import type { ToolApprovalAttentionSource } from "../../extensibility/extensions/runner";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
 import { detectCacheInvalidation } from "../../modes/components/cache-invalidation-marker";
 import {
@@ -106,10 +107,10 @@ export class EventController {
 	#renderedCustomMessages = new Set<string>();
 	#lastIntent: string | undefined = undefined;
 	#backgroundTaskCallIds = new Set<string>();
-	/** Tool calls whose approval prompt drove the title into `attention`; cleared
-	 *  at their tool_execution_end so the title returns to `working`. */
-	#approvalAttentionToolCallIds = new Set<string>();
+	/** Independent prompt sources that keep the title in `attention`. */
+	#nativeApprovalAttentionToolCallIds = new Set<string>();
 	#extensionApprovalAttentionToolCallIds = new Set<string>();
+	#askAttentionToolCallIds = new Set<string>();
 	#approvalPreviewGates = new Map<string, ApprovalPreviewGate>();
 	#pendingStreamPreviews = new Map<string, unknown>();
 	#detachToolApprovalPreviewWaiter: (() => void) | undefined;
@@ -233,8 +234,7 @@ export class EventController {
 			this.#waitForToolApprovalPreview(toolCallId),
 		);
 		this.#detachToolApprovalAttentionHandler = session?.extensionRunner?.setToolApprovalAttentionHandler(
-			(toolCallId, active) =>
-				this.#setToolApprovalAttention(this.#extensionApprovalAttentionToolCallIds, toolCallId, active),
+			(toolCallId, active, source) => this.#setToolApprovalAttentionSource(toolCallId, active, source),
 		);
 		vocalizer.setEnhancer(
 			session?.modelRegistry && session.agent && session.settings
@@ -419,11 +419,18 @@ export class EventController {
 		}
 		if (
 			toolCallIds.delete(toolCallId) &&
-			this.#approvalAttentionToolCallIds.size === 0 &&
-			this.#extensionApprovalAttentionToolCallIds.size === 0
+			this.#nativeApprovalAttentionToolCallIds.size === 0 &&
+			this.#extensionApprovalAttentionToolCallIds.size === 0 &&
+			this.#askAttentionToolCallIds.size === 0
 		) {
 			setTerminalTitleState("working");
 		}
+	}
+
+	#setToolApprovalAttentionSource(toolCallId: string, active: boolean, source: ToolApprovalAttentionSource): void {
+		const toolCallIds =
+			source === "native" ? this.#nativeApprovalAttentionToolCallIds : this.#extensionApprovalAttentionToolCallIds;
+		this.#setToolApprovalAttention(toolCallIds, toolCallId, active);
 	}
 
 	#startToolApprovalPreview(toolCallId: string): void {
@@ -757,8 +764,9 @@ export class EventController {
 		this.#orphanedToolCompletions.clear();
 		this.#postToolAssistantComponents.clear();
 		this.#backgroundTaskCallIds.clear();
-		this.#approvalAttentionToolCallIds.clear();
+		this.#nativeApprovalAttentionToolCallIds.clear();
 		this.#extensionApprovalAttentionToolCallIds.clear();
+		this.#askAttentionToolCallIds.clear();
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#lastAssistantComponent = undefined;
@@ -1558,8 +1566,10 @@ export class EventController {
 		this.#updateWorkingMessageFromIntent(event.intent);
 		const tool = this.ctx.viewSession.getToolByName(event.toolName);
 		const renderToolName = toolRenderName(event.toolName, tool);
-		if (renderToolName === "ask" || this.#toolWillPromptForApproval(renderToolName, event.args)) {
-			this.#setToolApprovalAttention(this.#approvalAttentionToolCallIds, event.toolCallId, true);
+		if (renderToolName === "ask")
+			this.#setToolApprovalAttention(this.#askAttentionToolCallIds, event.toolCallId, true);
+		if (this.#toolWillPromptForApproval(renderToolName, event.args)) {
+			this.#setToolApprovalAttention(this.#nativeApprovalAttentionToolCallIds, event.toolCallId, true);
 		}
 		this.#resolveDisplaceablePoll(renderToolName);
 		if (!this.ctx.pendingTools.has(event.toolCallId)) {
@@ -1757,12 +1767,11 @@ export class EventController {
 		// which only fire `tool_execution_end`, never `_update` — do not leave
 		// the UI looking idle while the session keeps streaming (#3857).
 		this.#ensureWorkingLoaderWhileStreaming();
-		// Return to `working` only when the LAST outstanding user-blocking prompt
-		// resolves: with queued approval prompts (always-ask/write), the first tool
-		// to finish must not clear the attention signal while another prompt still
-		// waits. `ask` ids are in the set too (added at tool_execution_start), so
-		// the delete also covers them without leaking ids until turn end.
-		this.#setToolApprovalAttention(this.#approvalAttentionToolCallIds, event.toolCallId, false);
+		// Native approval and Ask attention last until tool completion. Extension
+		// approval clears when its selector resolves. The title returns to `working`
+		// only after every source is clear.
+		this.#setToolApprovalAttention(this.#nativeApprovalAttentionToolCallIds, event.toolCallId, false);
+		this.#setToolApprovalAttention(this.#askAttentionToolCallIds, event.toolCallId, false);
 		if (event.toolName === "read") {
 			if (this.#inlineReadToolImages(event.toolCallId, event.result)) {
 				const component = this.ctx.pendingTools.get(event.toolCallId);
@@ -1962,8 +1971,9 @@ export class EventController {
 		}
 		await this.ctx.flushPendingModelSwitch();
 		this.#sealAbandonedForegroundTools();
-		this.#approvalAttentionToolCallIds.clear();
+		this.#nativeApprovalAttentionToolCallIds.clear();
 		this.#extensionApprovalAttentionToolCallIds.clear();
+		this.#askAttentionToolCallIds.clear();
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
 		this.#priorTurnToolComponents = new Map(this.#toolTimelineComponents);

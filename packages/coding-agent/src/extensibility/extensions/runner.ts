@@ -436,11 +436,13 @@ interface ToolRegistrationScope {
 	closed: boolean;
 }
 
+export type ToolApprovalAttentionSource = "native" | "extension";
+
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
-	#toolApprovalAttentionHandler?: (toolCallId: string, active: boolean) => void;
+	#toolApprovalAttentionHandler?: (toolCallId: string, active: boolean, source: ToolApprovalAttentionSource) => void;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
@@ -878,15 +880,17 @@ export class ExtensionRunner {
 		await this.#toolApprovalPreviewWaiter?.(toolCallId);
 	}
 
-	setToolApprovalAttentionHandler(handler: (toolCallId: string, active: boolean) => void): () => void {
+	setToolApprovalAttentionHandler(
+		handler: (toolCallId: string, active: boolean, source: ToolApprovalAttentionSource) => void,
+	): () => void {
 		this.#toolApprovalAttentionHandler = handler;
 		return () => {
 			if (this.#toolApprovalAttentionHandler === handler) this.#toolApprovalAttentionHandler = undefined;
 		};
 	}
 
-	reportToolApprovalAttention(toolCallId: string, active: boolean): void {
-		this.#toolApprovalAttentionHandler?.(toolCallId, active);
+	reportToolApprovalAttention(toolCallId: string, active: boolean, source: ToolApprovalAttentionSource): void {
+		this.#toolApprovalAttentionHandler?.(toolCallId, active, source);
 	}
 
 	getUIContext(): ExtensionUIContext {
