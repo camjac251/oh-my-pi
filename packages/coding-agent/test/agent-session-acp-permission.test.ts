@@ -26,6 +26,7 @@ import type {
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { TRUNCATE_LENGTHS } from "@oh-my-pi/pi-coding-agent/tools/render-utils";
 import { dispatchXdevTool, resolveMountedXdevExecutable, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -301,6 +302,100 @@ it("extension ask uses one ACP permission request without form elicitation", asy
 
 	expect(permissionSpy).toHaveBeenCalledTimes(1);
 	expect(bashTool.executeCalls).toBe(1);
+});
+
+it("extension ask includes its bounded reason in the ACP permission request", async () => {
+	const bashTool = makeFakeTool("bash");
+	const permissionRequests: ClientBridgePermissionToolCall[] = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall, _options, _signal) {
+			permissionRequests.push(toolCall);
+			return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+		},
+	};
+	const runtime = new ExtensionRuntime();
+	const extension = await loadExtensionFromFactory(
+		pi => {
+			pi.on("tool_authorization", () => ({
+				decision: "ask",
+				reason: `Protected\tcommand\n${"界".repeat(200)}`,
+			}));
+		},
+		tempDir.path(),
+		new EventBus(),
+		runtime,
+		"acp-final-authorization-reason",
+	);
+	session = await createSession([bashTool], bridge, {}, { extension: { runtime, value: extension } });
+
+	await session.setActiveToolsByName(["bash"]);
+	const wrappedBash = session.agent.state.tools.find(tool => tool.name === "bash");
+	await wrappedBash!.execute(
+		"call-extension-reason",
+		{ command: "echo hi" },
+		undefined,
+		undefined as never,
+		{ hasUI: false } as never,
+	);
+
+	const content = permissionRequests[0]?.content as
+		| Array<{ type: string; content?: { type: string; text?: string } }>
+		| undefined;
+	const reason = content?.find(item => item.content?.text?.startsWith("Protected"))?.content?.text;
+	expect(reason).toContain("Protected command");
+	expect(reason).not.toContain("\t");
+	expect(reason).not.toContain("\n");
+	expect(reason).toContain("…");
+	expect(Bun.stringWidth(reason ?? "")).toBeLessThanOrEqual(TRUNCATE_LENGTHS.CONTENT);
+});
+
+it("explicit yolo skips routine ACP prompts but preserves extension asks", async () => {
+	const bashTool = makeFakeTool("bash");
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	const runtime = new ExtensionRuntime();
+	let authorizationCalls = 0;
+	const extension = await loadExtensionFromFactory(
+		pi => {
+			pi.on("tool_authorization", () => {
+				authorizationCalls++;
+				return authorizationCalls === 1
+					? { decision: "allow" }
+					: { decision: "ask", reason: "Confirm protected command" };
+			});
+		},
+		tempDir.path(),
+		new EventBus(),
+		runtime,
+		"acp-final-authorization-yolo-fallback",
+	);
+	session = await createSession(
+		[bashTool],
+		bridge,
+		{ "tools.approvalMode": "yolo" },
+		{ extension: { runtime, value: extension } },
+	);
+
+	await session.setActiveToolsByName(["bash"]);
+	const wrappedBash = session.agent.state.tools.find(tool => tool.name === "bash");
+	await wrappedBash!.execute(
+		"call-yolo-allow",
+		{ command: "echo first" },
+		undefined,
+		undefined as never,
+		{ hasUI: false } as never,
+	);
+	await wrappedBash!.execute(
+		"call-yolo-extension-ask",
+		{ command: "echo second" },
+		undefined,
+		undefined as never,
+		{ hasUI: false } as never,
+	);
+
+	expect(permissionSpy).toHaveBeenCalledTimes(1);
+	expect(bashTool.executeCalls).toBe(2);
 });
 
 it("extension ask requires fresh ACP permission after a persisted allow", async () => {

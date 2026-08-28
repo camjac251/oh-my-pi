@@ -329,6 +329,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			!nativeApprovalRequired &&
 			context?.hasUI !== true &&
 			getPermissionIntent(this.tool.name, effectiveParams) !== undefined;
+		const approvalReason =
+			extensionApprovalRequired && approvalCheck.reason ? approvalData(approvalCheck.reason) : approvalCheck.reason;
 
 		if (approvalCheck.required && !deferExtensionApprovalToAcp) {
 			if (matchesScheduledCall && !hasFinalAuthorization) {
@@ -387,10 +389,6 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 
 			const uiContext = this.runner.getUIContext();
-			const approvalReason =
-				extensionApprovalRequired && approvalCheck.reason
-					? approvalData(approvalCheck.reason)
-					: approvalCheck.reason;
 			const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalReason);
 			const safetyPrompt =
 				pendingSafetyChecks.length > 0
@@ -434,7 +432,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			result = await this.runner.runScoped(() =>
 				withFileMutationSession(this.runner.sessionId, () => {
 					if (extensionApprovalGranted) return withApprovedAcpToolCall(toolCallId, executeTool);
-					if (deferExtensionApprovalToAcp) return withRequiredAcpApproval(toolCallId, executeTool);
+					if (deferExtensionApprovalToAcp)
+						return withRequiredAcpApproval(toolCallId, approvalReason, executeTool);
 					return executeTool();
 				}),
 			);

@@ -30,6 +30,7 @@ import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import {
 	extractPermissionLocations,
 	getPermissionIntent,
+	getRequiredAcpApprovalReason,
 	isApprovedAcpToolCall,
 	PERMISSION_OPTIONS,
 	PERMISSION_OPTIONS_BY_ID,
@@ -704,25 +705,31 @@ export class SessionTools {
 	 * When the user has explicitly opted into `yolo` / auto-approve behavior (via
 	 * the SDK/CLI `autoApprove` flag or a configured `tools.approvalMode: yolo`),
 	 * skips the gate unless the per-tool policy explicitly requires a prompt or
-	 * deny. The schema default is also `yolo`, so an explicit configuration or
-	 * explicit session flag is required: default-config ACP sessions keep the
-	 * client-side permission gate.
+	 * deny. Extension wrappers retain a dormant gate so a final authorization
+	 * ask can still request permission without prompting routine yolo calls. The
+	 * schema default is also `yolo`, so an explicit configuration or explicit
+	 * session flag is required: default-config ACP sessions keep the client-side
+	 * permission gate.
 	 */
-	#wrapToolForAcpPermission<T extends AgentTool>(tool: T): T {
+	#wrapToolForAcpPermission<T extends AgentTool>(tool: T, permissionOnlyWhenRequired = false): T {
 		const bridge = this.#host.clientBridge();
 		// Match the capability+method gating pattern used by read/write/bash.
 		if (!bridge?.capabilities.requestPermission || !bridge.requestPermission) return tool;
 		if (PERMISSION_REQUIRED_TOOLS[tool.name] !== true) return tool;
 		// Skip the gate only on explicit yolo opt-in; honour per-tool policies
 		// that require a prompt or deny (matching the normal approval wrapper).
+		let skipsRoutinePermission = false;
 		if (this.#isExplicitAutoApproveMode()) {
 			const userPolicies = (this.#host.settings.get("tools.approval") ?? {}) as Record<string, unknown>;
 			const toolPolicy = userPolicies[tool.name];
-			if (!toolPolicy || toolPolicy === "allow") return tool;
+			skipsRoutinePermission = !toolPolicy || toolPolicy === "allow";
 		}
 		if (tool instanceof ExtensionToolWrapper) {
-			return tool.wrapInnerTool(innerTool => this.#wrapToolForAcpPermission(innerTool)) as unknown as T;
+			return tool.wrapInnerTool(innerTool =>
+				this.#wrapToolForAcpPermission(innerTool, permissionOnlyWhenRequired || skipsRoutinePermission),
+			) as unknown as T;
 		}
+		if (skipsRoutinePermission && !permissionOnlyWhenRequired) return tool;
 		return new Proxy(tool, {
 			get: (target, prop) => {
 				if (prop !== "execute") return target[prop as keyof T];
@@ -744,6 +751,10 @@ export class SessionTools {
 					const commandContent = command
 						? [{ type: "content" as const, content: { type: "text" as const, text: `$ ${command}` } }]
 						: undefined;
+					const freshApprovalRequired = requiresFreshAcpApproval(toolCallId);
+					if (permissionOnlyWhenRequired && !freshApprovalRequired) {
+						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
+					}
 					// Short-circuit on persisted decisions.
 					const persisted = this.#acpPermissionDecisions.get(permissionIntent.cacheKey);
 					if (persisted === "reject_always") {
@@ -752,7 +763,7 @@ export class SessionTools {
 					if (isApprovedAcpToolCall(toolCallId)) {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
-					if (persisted === "allow_always" && !requiresFreshAcpApproval(toolCallId)) {
+					if (persisted === "allow_always" && !freshApprovalRequired) {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
 					if (signal?.aborted) {
@@ -766,6 +777,18 @@ export class SessionTools {
 					signal?.addEventListener("abort", onAbort, { once: true });
 					let raced: PermissionRaceResult;
 					try {
+						const requiredApprovalReason = getRequiredAcpApprovalReason(toolCallId);
+						const permissionContent = [
+							...(requiredApprovalReason
+								? [
+										{
+											type: "content" as const,
+											content: { type: "text" as const, text: requiredApprovalReason },
+										},
+									]
+								: []),
+							...(commandContent ?? []),
+						];
 						const permissionPromise = bridge.requestPermission!(
 							{
 								toolCallId,
@@ -774,7 +797,7 @@ export class SessionTools {
 								...(target.name === "bash" ? { kind: "execute" } : {}),
 								status: "pending",
 								rawInput: args,
-								...(commandContent ? { content: commandContent } : {}),
+								...(permissionContent.length > 0 ? { content: permissionContent } : {}),
 								locations: extractPermissionLocations(
 									args,
 									this.#host.sessionManager.getCwd(),
