@@ -104,7 +104,7 @@ export interface QuestionResult {
 	multi: boolean;
 	selectedOptions: string[];
 	customInput?: string;
-	/** Optional note attached to the selected answer in the rich ask dialog. */
+	/** Optional note attached to the question in the rich ask dialog. */
 	note?: string;
 	/** True when the answer was auto-selected because the dialog timed out. */
 	timedOut?: boolean;
@@ -116,7 +116,7 @@ export interface AskToolDetails {
 	multi?: boolean;
 	selectedOptions?: string[];
 	customInput?: string;
-	/** Optional note attached to the selected answer in the rich ask dialog. */
+	/** Optional note attached to the question in the rich ask dialog. */
 	note?: string;
 	/** True when the answer was auto-selected because the dialog timed out. */
 	timedOut?: boolean;
