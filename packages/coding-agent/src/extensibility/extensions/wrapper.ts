@@ -212,6 +212,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		return target.restartForModeChange();
 	}
 
+	wrapInnerTool(
+		wrap: (tool: AgentTool<TParameters, TDetails>) => AgentTool<TParameters, TDetails>,
+	): ExtensionToolWrapper<TParameters, TDetails> {
+		return new ExtensionToolWrapper(wrap(this.tool), this.runner);
+	}
+
 	async execute(
 		toolCallId: string,
 		params: Static<TParameters>,
@@ -332,6 +338,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				(resolved.policy === "prompt" && !acpBypass && (manualPromptRequired || !xdevBypass)),
 			reason: resolved.reason,
 		};
+		const nativeApprovalRequired = approvalCheck.required;
 		const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
 		const matchesScheduledCall =
 			scheduledCall?.id === toolCallId &&
@@ -441,12 +448,18 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
 					: basePrompt;
 			let choice: string | undefined;
+			const extensionOnlyApproval = extensionApprovalRequired && !nativeApprovalRequired;
+			if (extensionOnlyApproval) this.runner.reportToolApprovalAttention(toolCallId, true);
 			try {
-				choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
+				choice = signal
+					? await uiContext.select(safetyPrompt, ["Approve", "Deny"], { signal })
+					: await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
 			} catch (err) {
 				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
 				cancelPreflight();
 				throw err;
+			} finally {
+				if (extensionOnlyApproval) this.runner.reportToolApprovalAttention(toolCallId, false);
 			}
 			const approved = choice === "Approve";
 			await emitApprovalResolved(approved, approved ? undefined : "denied by user");
