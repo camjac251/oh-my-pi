@@ -23,14 +23,29 @@ export const PERMISSION_OPTIONS: ClientBridgePermissionOption[] = [
 /** Permission options indexed by their wire identifiers; unknown IDs miss and fail closed. */
 export const PERMISSION_OPTIONS_BY_ID = new Map(PERMISSION_OPTIONS.map(option => [option.optionId, option]));
 
-const approvedToolCall = new AsyncLocalStorage<string>();
+type AcpApprovalScope = {
+	toolCallId: string;
+	mode: "approved" | "required";
+};
+
+const acpApprovalScope = new AsyncLocalStorage<AcpApprovalScope>();
 
 export function withApprovedAcpToolCall<T>(toolCallId: string, execute: () => Promise<T>): Promise<T> {
-	return approvedToolCall.run(toolCallId, execute);
+	return acpApprovalScope.run({ toolCallId, mode: "approved" }, execute);
 }
 
 export function isApprovedAcpToolCall(toolCallId: string): boolean {
-	return approvedToolCall.getStore() === toolCallId;
+	const scope = acpApprovalScope.getStore();
+	return scope?.toolCallId === toolCallId && scope.mode === "approved";
+}
+
+export function withRequiredAcpApproval<T>(toolCallId: string, execute: () => Promise<T>): Promise<T> {
+	return acpApprovalScope.run({ toolCallId, mode: "required" }, execute);
+}
+
+export function requiresFreshAcpApproval(toolCallId: string): boolean {
+	const scope = acpApprovalScope.getStore();
+	return scope?.toolCallId === toolCallId && scope.mode === "required";
 }
 
 function getEditDestructiveIntent(args: unknown): { kind: "delete" | "move"; paths: string[] } | undefined {

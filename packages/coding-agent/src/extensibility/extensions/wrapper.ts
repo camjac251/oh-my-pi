@@ -12,7 +12,7 @@ import {
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import { sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
-import { getPermissionIntent, withApprovedAcpToolCall } from "../../session/acp-permission-gate";
+import { getPermissionIntent, withApprovedAcpToolCall, withRequiredAcpApproval } from "../../session/acp-permission-gate";
 import { denyError, formatApprovalPrompt, resolveApproval, resolveApprovalFromContext } from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
@@ -496,9 +496,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			// a runner exists.
 			const executeTool = () => this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context);
 			result = await this.runner.runScoped(() =>
-				withFileMutationSession(this.runner.sessionId, () =>
-					extensionApprovalGranted ? withApprovedAcpToolCall(toolCallId, executeTool) : executeTool(),
-				),
+				withFileMutationSession(this.runner.sessionId, () => {
+					if (extensionApprovalGranted) return withApprovedAcpToolCall(toolCallId, executeTool);
+					if (deferExtensionApprovalToAcp) return withRequiredAcpApproval(toolCallId, executeTool);
+					return executeTool();
+				}),
 			);
 		} catch (err) {
 			executionError = err instanceof Error ? err : new Error(String(err));
