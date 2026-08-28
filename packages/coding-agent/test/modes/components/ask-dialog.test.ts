@@ -484,6 +484,38 @@ describe("AskDialogComponent", () => {
 		expect(onSubmit.mock.calls[0][0].results[0].note).toBe("Updated note");
 	});
 
+	it("clears a question note when the editor submits whitespace", async () => {
+		const onPrompt = vi
+			.fn()
+			.mockReturnValueOnce(Promise.resolve("Initial note"))
+			.mockReturnValueOnce(Promise.resolve("   "));
+		const onSubmit = vi.fn();
+		const component = new AskDialogComponent(
+			[
+				{
+					id: "q1",
+					question: "Choose one?",
+					options: [{ label: "Option A" }],
+				},
+			],
+			{ onSubmit, onCancel: vi.fn(), onPrompt },
+		);
+
+		component.handleInput("n");
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(render(component)).toContain("✎ Note: Initial note");
+
+		component.handleInput("n");
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(render(component)).not.toContain("✎ Note:");
+		expect(render(component)).toContain("n note");
+
+		component.handleInput(ENTER);
+		expect(onSubmit.mock.calls[0][0].results[0].note).toBeUndefined();
+	});
+
 	it("preserves a note when a single-select answer changes", async () => {
 		const onPrompt = vi.fn().mockReturnValue(Promise.resolve("Note for A"));
 		const onSubmit = vi.fn();

@@ -938,6 +938,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 					if (!question || !result || result.id !== question.id) {
 						throw new Error("Ask dialog returned results that do not match the requested question order");
 					}
+					const note = result.note?.trim() ? result.note : undefined;
 					results.push({
 						id: question.id,
 						question: question.question,
@@ -945,7 +946,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 						multi: question.multi ?? false,
 						selectedOptions: result.selectedOptions,
 						customInput: result.customInput,
-						note: result.note,
+						note,
 						timedOut: result.timedOut,
 					});
 				}
@@ -959,7 +960,8 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 						(!result.timedOut &&
 							!result.multi &&
 							result.selectedOptions.length === 0 &&
-							result.customInput === undefined)
+							result.customInput === undefined &&
+							result.note === undefined)
 					) {
 						context.abort();
 						throw new ToolAbortError("Ask tool was cancelled by the user");

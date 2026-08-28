@@ -115,7 +115,6 @@ type QuestionRowKind = "option" | "other";
 
 interface QuestionRow {
 	kind: QuestionRowKind;
-	key: string;
 	label: string;
 	optionIndex: number | undefined;
 }
@@ -648,11 +647,10 @@ export class AskDialogComponent implements Component {
 	#questionRows(question: ExtensionAskDialogQuestion): QuestionRow[] {
 		const rows: QuestionRow[] = question.options.map((option, index) => ({
 			kind: "option",
-			key: `option:${index}`,
 			label: this.#optionLabel(question, option.label, index),
 			optionIndex: index,
 		}));
-		rows.push({ kind: "other", key: "other", label: OTHER_OPTION, optionIndex: undefined });
+		rows.push({ kind: "other", label: OTHER_OPTION, optionIndex: undefined });
 		return rows;
 	}
 
@@ -796,7 +794,7 @@ export class AskDialogComponent implements Component {
 		try {
 			const input = await this.callbacks.onPrompt(boundPromptTitle("Note: ", question.question), state.note);
 			if (input === undefined || this.#closed) return;
-			state.note = input;
+			state.note = input.trim() ? input : undefined;
 		} finally {
 			this.#promptActive = false;
 			this.#runDeferredTimeout();
