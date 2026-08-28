@@ -810,7 +810,17 @@ export class AskDialogComponent implements Component {
 		const { question, state } = active;
 		const rowItems = this.#questionRows(question);
 		state.cursorIndex = clamp(state.cursorIndex, 0, Math.max(0, rowItems.length - 1));
-		return this.#renderQuestionList(question, state, rowItems, width, maxRows);
+		const note = state.note?.trim() ? normalizedInlineInput(state.note) : undefined;
+		if (!note) return this.#renderQuestionList(question, state, rowItems, width, maxRows);
+		const noteLine = theme.fg(
+			"warning",
+			`✎ Note: ${truncateToWidth(note, Math.max(1, width - 8), Ellipsis.Unicode)}`,
+		);
+		if (maxRows <= 1) {
+			return { lines: maxRows === 1 ? [noteLine] : [], scrollOffset: state.scrollOffset, indicator: "" };
+		}
+		const list = this.#renderQuestionList(question, state, rowItems, width, maxRows - 1);
+		return { ...list, lines: [noteLine, ...list.lines] };
 	}
 
 	#renderQuestionList(
@@ -824,13 +834,6 @@ export class AskDialogComponent implements Component {
 		const renderRows = (contentWidth: number): { allLines: string[]; lineStartByRow: number[] } => {
 			const allLines: string[] = [];
 			const lineStartByRow: number[] = [];
-			if (state.note?.trim()) {
-				const note = normalizedInlineInput(state.note);
-				allLines.push(
-					theme.fg("muted", `Note: ${truncateToWidth(note, Math.max(1, contentWidth - 6), Ellipsis.Unicode)}`),
-					"",
-				);
-			}
 			for (let index = 0; index < rowItems.length; index++) {
 				lineStartByRow.push(allLines.length);
 				const rowItem = rowItems[index];
@@ -849,7 +852,7 @@ export class AskDialogComponent implements Component {
 			}
 			return { allLines, lineStartByRow };
 		};
-		const layoutKey = `${width}:${rows}:${state.customInput === undefined ? 0 : 1}:${state.note?.trim() ? 1 : 0}`;
+		const layoutKey = `${width}:${rows}:${state.customInput === undefined ? 0 : 1}`;
 		let overflowLayouts = this.#overflowLayouts.get(question);
 		const knownOverflow = overflowLayouts?.has(layoutKey) ?? false;
 		let renderedRows = renderRows(knownOverflow && width > 1 ? width - 1 : width);

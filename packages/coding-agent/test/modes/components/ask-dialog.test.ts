@@ -566,6 +566,8 @@ describe("AskDialogComponent", () => {
 		component.handleInput("n");
 		await Promise.resolve();
 		await Promise.resolve();
+		component.handleInput(DOWN);
+		expect(render(component)).toContain("✎ Note: Additional context");
 		component.handleInput(TAB);
 
 		const review = render(component);
