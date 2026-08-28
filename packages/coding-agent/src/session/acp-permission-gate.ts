@@ -26,6 +26,7 @@ export const PERMISSION_OPTIONS_BY_ID = new Map(PERMISSION_OPTIONS.map(option =>
 type AcpApprovalScope = {
 	toolCallId: string;
 	mode: "approved" | "required";
+	reason?: string;
 };
 
 const acpApprovalScope = new AsyncLocalStorage<AcpApprovalScope>();
@@ -39,13 +40,22 @@ export function isApprovedAcpToolCall(toolCallId: string): boolean {
 	return scope?.toolCallId === toolCallId && scope.mode === "approved";
 }
 
-export function withRequiredAcpApproval<T>(toolCallId: string, execute: () => Promise<T>): Promise<T> {
-	return acpApprovalScope.run({ toolCallId, mode: "required" }, execute);
+export function withRequiredAcpApproval<T>(
+	toolCallId: string,
+	reason: string | undefined,
+	execute: () => Promise<T>,
+): Promise<T> {
+	return acpApprovalScope.run({ toolCallId, mode: "required", ...(reason ? { reason } : {}) }, execute);
 }
 
 export function requiresFreshAcpApproval(toolCallId: string): boolean {
 	const scope = acpApprovalScope.getStore();
 	return scope?.toolCallId === toolCallId && scope.mode === "required";
+}
+
+export function getRequiredAcpApprovalReason(toolCallId: string): string | undefined {
+	const scope = acpApprovalScope.getStore();
+	return scope?.toolCallId === toolCallId && scope.mode === "required" ? scope.reason : undefined;
 }
 
 function getEditDestructiveIntent(args: unknown): { kind: "delete" | "move"; paths: string[] } | undefined {
