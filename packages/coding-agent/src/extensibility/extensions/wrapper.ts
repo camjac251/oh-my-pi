@@ -12,16 +12,11 @@ import {
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import { sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
-import { withApprovedAcpToolCall } from "../../session/acp-permission-gate";
-import {
-	denyError,
-	formatApprovalPrompt,
-	resolveApproval,
-	resolveApprovalFromContext,
-	truncateForPrompt,
-} from "../../tools/approval";
+import { getPermissionIntent, withApprovedAcpToolCall } from "../../session/acp-permission-gate";
+import { denyError, formatApprovalPrompt, resolveApproval, resolveApprovalFromContext } from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
+import { TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
@@ -171,7 +166,7 @@ function approvalData(value: string): string {
 	const sanitized = sanitizeText(value)
 		.replace(/[\r\n\t]+/g, " ")
 		.trim();
-	const truncated = truncateForPrompt(sanitized, 500);
+	const truncated = truncateToWidth(sanitized, TRUNCATE_LENGTHS.CONTENT);
 	return truncated.replace(/([\\`*_{}[\]()<>#+\-.!|])/g, "\\$1");
 }
 
@@ -200,6 +195,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 	constructor(
 		private tool: AgentTool<TParameters, TDetails>,
 		private runner: ExtensionRunner,
+		private readonly hasAcpPermissionFallback = false,
 	) {
 		applyToolProxy(tool, this);
 	}
@@ -216,7 +212,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 	wrapInnerTool(
 		wrap: (tool: AgentTool<TParameters, TDetails>) => AgentTool<TParameters, TDetails>,
 	): ExtensionToolWrapper<TParameters, TDetails> {
-		return new ExtensionToolWrapper(wrap(this.tool), this.runner);
+		return new ExtensionToolWrapper(wrap(this.tool), this.runner, true);
 	}
 
 	async execute(
@@ -385,7 +381,14 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			}
 		}
 
-		if (approvalCheck.required) {
+		const deferExtensionApprovalToAcp =
+			this.hasAcpPermissionFallback &&
+			extensionApprovalRequired &&
+			!nativeApprovalRequired &&
+			context?.hasUI !== true &&
+			getPermissionIntent(this.tool.name, effectiveParams) !== undefined;
+
+		if (approvalCheck.required && !deferExtensionApprovalToAcp) {
 			if (matchesScheduledCall && !hasFinalAuthorization) {
 				await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
 			}
