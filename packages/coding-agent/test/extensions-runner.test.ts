@@ -3693,6 +3693,50 @@ describe("ExtensionRunner", () => {
 			]);
 		});
 
+		it("signals attention while a final authorization handler dialog is open", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async (_event, ctx) => {
+						const approved = await ctx.ui.confirm("Protected action", "Allow this action?");
+						return approved ? { decision: "allow" } : { decision: "deny" };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-dialog-attention.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const attentionStates: Array<{
+				toolCallId: string;
+				active: boolean;
+				source: ToolApprovalAttentionSource;
+			}> = [];
+			runner.setToolApprovalAttentionHandler((toolCallId, active, source) => {
+				attentionStates.push({ toolCallId, active, source });
+			});
+			const confirm: ExtensionUIContext["confirm"] = async () => {
+				expect(attentionStates).toEqual([
+					{ toolCallId: "call-authorization-dialog-attention", active: true, source: "extension" },
+				]);
+				return true;
+			};
+			initApprovalRunner(runner, async () => undefined, { confirm });
+
+			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+			await wrapped.execute("call-authorization-dialog-attention", {}, undefined, undefined, yoloContext);
+
+			expect(attentionStates).toEqual([
+				{ toolCallId: "call-authorization-dialog-attention", active: true, source: "extension" },
+				{ toolCallId: "call-authorization-dialog-attention", active: false, source: "extension" },
+			]);
+		});
+
 		it("clears predicted native attention when final authorization allows", async () => {
 			const extCode = `
 				export default function(pi) {

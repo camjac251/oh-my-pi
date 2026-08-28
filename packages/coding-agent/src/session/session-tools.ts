@@ -30,6 +30,7 @@ import { type EditMode, resolveEditMode } from "../utils/edit-mode";
 import {
 	extractPermissionLocations,
 	getPermissionIntent,
+	isApprovedAcpToolCall,
 	PERMISSION_OPTIONS,
 	PERMISSION_OPTIONS_BY_ID,
 	PERMISSION_REQUIRED_TOOLS,
@@ -749,6 +750,9 @@ export class SessionTools {
 					}
 					if (persisted === "reject_always") {
 						throw new ToolError(`Tool call rejected by user (preference)`);
+					}
+					if (isApprovedAcpToolCall(toolCallId)) {
+						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
 					if (signal?.aborted) {
 						throw new ToolAbortError("Permission request cancelled");

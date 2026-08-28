@@ -15,7 +15,7 @@ import { type SettingPath, Settings } from "@oh-my-pi/pi-coding-agent/config/set
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
-import type { Extension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { Extension, ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type {
@@ -145,6 +145,38 @@ async function createSession(
 	return sess;
 }
 
+function initializeExtensionApprovalUI(runner: ExtensionRunner, select: ExtensionUIContext["select"]): void {
+	runner.initialize(
+		{
+			sendMessage: () => {},
+			sendUserMessage: () => {},
+			appendEntry: () => {},
+			setLabel: () => {},
+			getActiveTools: () => [],
+			getAllTools: () => [],
+			setActiveTools: async () => {},
+			getCommands: () => [],
+			setModel: async () => false,
+			getThinkingLevel: () => undefined,
+			setThinkingLevel: () => {},
+			getSessionName: () => undefined,
+			setSessionName: async () => {},
+		} as never,
+		{
+			getModel: () => undefined,
+			isIdle: () => true,
+			abort: () => {},
+			hasPendingMessages: () => false,
+			shutdown: () => {},
+			getContextUsage: () => undefined,
+			compact: async () => {},
+			getSystemPrompt: () => [],
+		} as never,
+		undefined,
+		{ select, notify: () => {} } as never,
+	);
+}
+
 async function createSessionWithMockModel(
 	tools: AgentTool[],
 	bridge: ClientBridge,
@@ -238,6 +270,82 @@ it("extension denial runs before an ACP permission request", async () => {
 		),
 	).rejects.toThrow("Blocked before ACP permission");
 	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(bashTool.executeCalls).toBe(0);
+});
+
+it("extension approval avoids a second ACP permission request", async () => {
+	const bashTool = makeFakeTool("bash");
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	const runtime = new ExtensionRuntime();
+	const extension = await loadExtensionFromFactory(
+		pi => {
+			pi.on("tool_authorization", () => ({ decision: "ask", reason: "Confirm protected command" }));
+		},
+		tempDir.path(),
+		new EventBus(),
+		runtime,
+		"acp-final-authorization-approval",
+	);
+	session = await createSession([bashTool], bridge, {}, { extension: { runtime, value: extension } });
+	let selectCalls = 0;
+	const select: ExtensionUIContext["select"] = async () => {
+		selectCalls++;
+		return "Approve";
+	};
+	if (!session.extensionRunner) throw new Error("expected extension runner");
+	initializeExtensionApprovalUI(session.extensionRunner, select);
+
+	await session.setActiveToolsByName(["bash"]);
+	const wrappedBash = session.agent.state.tools.find(tool => tool.name === "bash");
+	await wrappedBash!.execute(
+		"call-extension-approve",
+		{ command: "echo hi" },
+		undefined,
+		undefined as never,
+		undefined,
+	);
+
+	expect(selectCalls).toBe(1);
+	expect(permissionSpy).not.toHaveBeenCalled();
+	expect(bashTool.executeCalls).toBe(1);
+});
+
+it("persisted ACP rejection overrides later extension approval", async () => {
+	const bashTool = makeFakeTool("bash");
+	const bridge = makeBridge({ outcome: "selected", optionId: "reject_always", kind: "reject_always" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	const runtime = new ExtensionRuntime();
+	let authorizationCalls = 0;
+	const extension = await loadExtensionFromFactory(
+		pi => {
+			pi.on("tool_authorization", () => {
+				authorizationCalls++;
+				return authorizationCalls === 1
+					? { decision: "allow" }
+					: { decision: "ask", reason: "Confirm protected command" };
+			});
+		},
+		tempDir.path(),
+		new EventBus(),
+		runtime,
+		"acp-final-authorization-persisted-rejection",
+	);
+	session = await createSession([bashTool], bridge, {}, { extension: { runtime, value: extension } });
+	const select: ExtensionUIContext["select"] = async () => "Approve";
+	if (!session.extensionRunner) throw new Error("expected extension runner");
+	initializeExtensionApprovalUI(session.extensionRunner, select);
+
+	await session.setActiveToolsByName(["bash"]);
+	const wrappedBash = session.agent.state.tools.find(tool => tool.name === "bash");
+	await expect(
+		wrappedBash!.execute("call-persist-reject", { command: "echo hi" }, undefined, undefined as never, undefined),
+	).rejects.toThrow("Tool call rejected by user (bash)");
+	await expect(
+		wrappedBash!.execute("call-still-rejected", { command: "echo hi" }, undefined, undefined as never, undefined),
+	).rejects.toThrow("Tool call rejected by user (preference)");
+
+	expect(permissionSpy).toHaveBeenCalledTimes(1);
 	expect(bashTool.executeCalls).toBe(0);
 });
 
