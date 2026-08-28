@@ -32,6 +32,8 @@ import type {
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { TRUNCATE_LENGTHS } from "@oh-my-pi/pi-coding-agent/tools/render-utils";
+import { visibleWidth } from "@oh-my-pi/pi-tui";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 
 describe("ExtensionRunner", () => {
@@ -3825,7 +3827,7 @@ describe("ExtensionRunner", () => {
 				export default function(pi) {
 					pi.on("tool_authorization", async () => ({
 						decision: "ask",
-						reason: "Protected\\twrite\\n\\u001b[31mred\\u001b[0m" + "x".repeat(700),
+						reason: "Protected\\twrite\\n\\u001b[31mred\\u001b[0m" + "界".repeat(200),
 					}));
 				}
 			`;
@@ -3850,8 +3852,10 @@ describe("ExtensionRunner", () => {
 			expect(reasonLine).toContain("Protected write red");
 			expect(reasonLine).not.toContain("\t");
 			expect(reasonLine).not.toContain("\u001b");
-			expect(reasonLine).toContain("elided");
-			expect(reasonLine?.length).toBeLessThan(550);
+			expect(reasonLine).toContain("…");
+			expect(visibleWidth(reasonLine ?? "")).toBeLessThanOrEqual(
+				visibleWidth("Reason: ") + TRUNCATE_LENGTHS.CONTENT,
+			);
 		});
 
 		it("explains extension-required approval when no interactive UI is available", async () => {
