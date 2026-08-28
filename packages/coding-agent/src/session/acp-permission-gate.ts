@@ -25,37 +25,45 @@ export const PERMISSION_OPTIONS_BY_ID = new Map(PERMISSION_OPTIONS.map(option =>
 
 type AcpApprovalScope = {
 	toolCallId: string;
+	toolName: string;
 	mode: "approved" | "required";
 	reason?: string;
 };
 
 const acpApprovalScope = new AsyncLocalStorage<AcpApprovalScope>();
 
-export function withApprovedAcpToolCall<T>(toolCallId: string, execute: () => Promise<T>): Promise<T> {
-	return acpApprovalScope.run({ toolCallId, mode: "approved" }, execute);
+export function withApprovedAcpToolCall<T>(
+	toolCallId: string,
+	toolName: string,
+	execute: () => Promise<T>,
+): Promise<T> {
+	return acpApprovalScope.run({ toolCallId, toolName, mode: "approved" }, execute);
 }
 
-export function isApprovedAcpToolCall(toolCallId: string): boolean {
+export function isApprovedAcpToolCall(toolCallId: string, toolName: string): boolean {
 	const scope = acpApprovalScope.getStore();
-	return scope?.toolCallId === toolCallId && scope.mode === "approved";
+	return scope?.toolCallId === toolCallId && scope.toolName === toolName && scope.mode === "approved";
 }
 
 export function withRequiredAcpApproval<T>(
 	toolCallId: string,
+	toolName: string,
 	reason: string | undefined,
 	execute: () => Promise<T>,
 ): Promise<T> {
-	return acpApprovalScope.run({ toolCallId, mode: "required", ...(reason ? { reason } : {}) }, execute);
+	return acpApprovalScope.run({ toolCallId, toolName, mode: "required", ...(reason ? { reason } : {}) }, execute);
 }
 
-export function requiresFreshAcpApproval(toolCallId: string): boolean {
+export function requiresFreshAcpApproval(toolCallId: string, toolName: string): boolean {
 	const scope = acpApprovalScope.getStore();
-	return scope?.toolCallId === toolCallId && scope.mode === "required";
+	return scope?.toolCallId === toolCallId && scope.toolName === toolName && scope.mode === "required";
 }
 
-export function getRequiredAcpApprovalReason(toolCallId: string): string | undefined {
+export function getRequiredAcpApprovalReason(toolCallId: string, toolName: string): string | undefined {
 	const scope = acpApprovalScope.getStore();
-	return scope?.toolCallId === toolCallId && scope.mode === "required" ? scope.reason : undefined;
+	return scope?.toolCallId === toolCallId && scope.toolName === toolName && scope.mode === "required"
+		? scope.reason
+		: undefined;
 }
 
 function getEditDestructiveIntent(args: unknown): { kind: "delete" | "move"; paths: string[] } | undefined {
