@@ -45,7 +45,7 @@
 3. It reads `ask.timeout` from settings, converts seconds to milliseconds (`0` disables timeout), and disables timeout entirely while plan mode is enabled.
 4. If `ask.notify` is not `off`, it sends a terminal notification: `Waiting for input`. When `speech.enabled` is true, it also sends all question text to the vocalizer before opening the dialog.
 5. When the UI supplies `askDialog`, the tool opens one rich multi-question form. Rich options receive `header`, `description`, and `preview`; results may contain a question note or choose the dialog's `Chat about this` redirect.
-6. A rich-dialog custom answer is saved on the first editor submission and advances immediately. A question note remains visible in the dialog and review, is included even when the question is unanswered, and persists when the selected answer changes. Submitting an empty or whitespace-only note clears it.
+6. A rich-dialog custom answer is saved on the first editor submission and advances immediately. A question note remains visible in the dialog and review, is included even when the question is unanswered, and persists when the selected answer changes. Adding a note to a single-select question exposes the Submit tab so note-only context can be reviewed and sent without choosing an option. Submitting an empty or whitespace-only note clears it.
 7. Otherwise it uses the selector/editor fallback for each question:
    - single-select list plus `Other (type your own)`
    - multi-select checkbox loop plus `Done selecting` when applicable and `Other (type your own)`

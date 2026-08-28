@@ -716,6 +716,7 @@ function formatQuestionResult(result: QuestionResult): string {
 			? `${result.id}: [${result.selectedOptions.join(", ")}]${suffix}`
 			: `${result.id}: ${result.selectedOptions[0]}${suffix}`;
 	}
+	if (!result.multi && result.note) return `${result.id}: (unanswered)${noteSuffix}`;
 	return result.multi ? `${result.id}: []${noteSuffix}` : `${result.id}: (cancelled)${noteSuffix}`;
 }
 

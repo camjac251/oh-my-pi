@@ -611,6 +611,39 @@ describe("AskDialogComponent", () => {
 		expect(onSubmit.mock.calls[0][0].results[0].note).toBe("Additional context");
 	});
 
+	it("shows Submit for a single-select note-only response", async () => {
+		const onPrompt = vi.fn().mockReturnValue(Promise.resolve("Additional context"));
+		const onSubmit = vi.fn();
+		const component = new AskDialogComponent(
+			[
+				{
+					id: "q1",
+					question: "Choose one?",
+					options: [{ label: "Option A" }, { label: "Option B" }],
+				},
+			],
+			{ onSubmit, onCancel: vi.fn(), onPrompt },
+		);
+
+		component.handleInput("n");
+		await Promise.resolve();
+		await Promise.resolve();
+
+		const question = render(component);
+		expect(question).toContain("Submit");
+		expect(question).toContain("Tab/←/→");
+
+		component.handleInput(TAB);
+		const review = render(component);
+		expect(review).toContain("unanswered");
+		expect(review).toContain("Note: Additional context");
+
+		component.handleInput(ENTER);
+		expect(onSubmit).toHaveBeenCalledTimes(1);
+		expect(onSubmit.mock.calls[0][0].results[0].selectedOptions).toEqual([]);
+		expect(onSubmit.mock.calls[0][0].results[0].note).toBe("Additional context");
+	});
+
 	it("advances after the first multi-select custom input and shows it on Submit", async () => {
 		const onPrompt = vi.fn().mockReturnValue(Promise.resolve("custom detail"));
 		const onSubmit = vi.fn();

@@ -563,8 +563,14 @@ export class AskDialogComponent implements Component {
 
 	#hasSubmitTab(): boolean {
 		// Multi questions confirm on the Submit tab, so any multi question
-		// forces the tab even when there is only one question.
-		return this.#questions.length > 1 || this.#questions.some(question => question.multi);
+		// forces the tab even when there is only one question. A note on a
+		// single-select question also needs this path so it can be submitted
+		// without selecting an answer.
+		return (
+			this.#questions.length > 1 ||
+			this.#questions.some(question => question.multi) ||
+			this.#states.some(state => state.note !== undefined)
+		);
 	}
 
 	#submitTabIndex(): number {
