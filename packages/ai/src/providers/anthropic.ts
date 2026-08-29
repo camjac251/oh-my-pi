@@ -3194,8 +3194,38 @@ function applyCacheControlToLastBlock(blocks: ContentBlockParam[], cacheControl:
 	return false;
 }
 
+/**
+ * Mark the tool array so the stable head gets a cache entry of its own.
+ *
+ * Anthropic writes an entry only AT a marked block; the backward lookback finds
+ * entries prior requests wrote, never unmarked stable content behind them. With
+ * markers only in the trailing message window, the `tools` -> `system` head has
+ * no entry at any position, so any divergence in the message region (compaction
+ * rebuilding history, a rewind onto another branch, a resumed session) reprocesses
+ * the tool definitions along with everything else.
+ *
+ * The tool array sits first in wire order, so an entry here survives every
+ * message-region rewrite, and it is the one region sibling subagents of the same
+ * definition share byte for byte. Breakpoints themselves are free (only written
+ * and read tokens are billed) and a prefix below the model's minimum cacheable
+ * length is processed uncached without an error, so a short tool array degrades
+ * to a no-op rather than a failure.
+ */
+function applyToolPromptCaching(tools: AnthropicWireTool[] | undefined, cacheControl: AnthropicCacheControl): void {
+	if (!tools?.length) return;
+	const lastIndex = tools.length - 1;
+	const lastTool = tools[lastIndex];
+	if (!lastTool || lastTool.cache_control != null) return;
+	tools[lastIndex] = { ...lastTool, cache_control: cloneAnthropicCacheControl(cacheControl) };
+}
+
 function applyPromptCaching(params: MessageCreateParamsStreaming, cacheControl?: AnthropicCacheControl): void {
 	if (!cacheControl) return;
+
+	// One marker on the tool array plus the two-message rolling window below is
+	// three of Anthropic's four breakpoints, leaving one spare. Both carry the
+	// same TTL, so the "longer TTL must precede shorter" rule cannot be violated.
+	applyToolPromptCaching(params.tools, cacheControl);
 
 	// `convertAnthropicMessages` appends this neutral pad after a trailing
 	// assistant because Anthropic rejects assistant-prefill endings. It is absent

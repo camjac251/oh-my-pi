@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed direct Anthropic requests never caching the tool array. Anthropic writes a cache entry only at a `cache_control` marker, and the backward lookback finds entries earlier requests wrote rather than unmarked stable content behind them, so with markers only on the trailing two messages the `tools` -> `system` head had no entry at any position and every message-region divergence (compaction rebuilding history, a rewind onto another branch, a resumed session) reprocessed the tool definitions too. The last tool definition now carries a breakpoint, which caches every definition before it as a single prefix that survives message-region rewrites and is shared byte for byte between sibling subagents of the same definition. This spends a third of the four available breakpoints; breakpoints themselves are free, and a tool array below the model's minimum cacheable length is processed uncached without an error rather than failing.
+
 ## [18.0.11] - 2026-08-29
 
 ### Fixed
