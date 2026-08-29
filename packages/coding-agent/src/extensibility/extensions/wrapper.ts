@@ -206,7 +206,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// re-resolves against the (possibly revised) input so a handler cannot rewrite into a denied or
 		// newly prompt-gated command and have it run unapproved.
 		const cliAutoApprove = context?.autoApprove === true;
-		const settings: Settings | undefined = context?.settings;
+		const settings: Settings | undefined = context?.settings ?? this.runner.sessionSettings;
 		const configuredMode = (settings?.get("tools.approvalMode") ?? "yolo") as ApprovalMode;
 		const approvalMode: ApprovalMode = cliAutoApprove ? "yolo" : configuredMode;
 		const userPolicies = (settings?.get("tools.approval") ?? {}) as Record<string, unknown>;

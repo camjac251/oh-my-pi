@@ -3475,6 +3475,53 @@ describe("ExtensionRunner", () => {
 			delete globalState.__authorizationSessionIds;
 		});
 
+		it("uses runner approval settings for contextless final authorization", async () => {
+			const postures: Array<{ approvalMode: string; nativeDecision: string }> = [];
+			const extCode = `
+				export default function(pi) {
+					pi.on("tool_authorization", async (event) => {
+						globalThis.__authorizationPostures.push({
+							approvalMode: event.approvalMode,
+							nativeDecision: event.nativeDecision,
+						});
+						return { decision: "allow" };
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-posture.ts"), extCode);
+			const globalState = globalThis as typeof globalThis & {
+				__authorizationPostures?: typeof postures;
+			};
+			globalState.__authorizationPostures = postures;
+
+			try {
+				const result = await loadTestExtensions();
+				const settings = {
+					get: (key: string) => {
+						if (key === "tools.approvalMode") return "always-ask";
+						if (key === "tools.approval") return {};
+						return undefined;
+					},
+				} as never;
+				const runner = new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+					undefined,
+					settings,
+				);
+				const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
+
+				await wrapped.execute("call-authorization-posture", {});
+
+				expect(postures).toEqual([{ approvalMode: "always-ask", nativeDecision: "ask" }]);
+			} finally {
+				delete globalState.__authorizationPostures;
+			}
+		});
+
 		it("authorizes hashline edits against their canonical target paths without rewriting execution", async () => {
 			const extCode = `
 				export default function(pi) {
@@ -3986,11 +4033,14 @@ describe("ExtensionRunner", () => {
 			expect(visibleWidth(message)).toBeLessThanOrEqual(TRUNCATE_LENGTHS.CONTENT);
 		});
 
-		it("denies execution when a final authorization handler fails", async () => {
+		it("sanitizes the denial when a final authorization handler fails", async () => {
+			const failureMessage = `${path.join(homedir(), "secrets")}\t\u001b[31mred\u001b[0m\n${"界".repeat(
+				TRUNCATE_LENGTHS.CONTENT,
+			)}`;
 			const extCode = `
 				export default function(pi) {
 					pi.on("tool_authorization", async () => {
-						throw new Error("authorization failed");
+						throw new Error(${JSON.stringify(failureMessage)});
 					});
 				}
 			`;
@@ -4007,9 +4057,23 @@ describe("ExtensionRunner", () => {
 			);
 			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
 
-			await expect(
-				wrapped.execute("call-authorization-failure", {}, undefined, undefined, yoloContext),
-			).rejects.toThrow("Extension ~/.omp/extensions/tool-authorization-failure.ts failed: authorization failed");
+			let thrown: Error | undefined;
+			try {
+				await wrapped.execute("call-authorization-failure", {}, undefined, undefined, yoloContext);
+			} catch (error) {
+				if (!(error instanceof Error)) throw error;
+				thrown = error;
+			}
+
+			const message = thrown?.message ?? "";
+			expect(thrown).toBeDefined();
+			expect(message).toContain("Extension ~/.omp/extensions/tool-authorization-failure.ts failed: ~/secrets red");
+			expect(message).not.toContain(homedir());
+			expect(message).not.toContain("\t");
+			expect(message).not.toContain("\n");
+			expect(message).not.toContain("\u001b");
+			expect(message).toContain("…");
+			expect(visibleWidth(message)).toBeLessThanOrEqual(TRUNCATE_LENGTHS.CONTENT);
 		});
 
 		it("denies execution when a final authorization handler times out", async () => {

@@ -679,6 +679,10 @@ export class ExtensionRunner {
 		return this.sessionManager.getSessionId();
 	}
 
+	get sessionSettings(): Settings | undefined {
+		return this.settings;
+	}
+
 	initialize(
 		actions: ExtensionActions,
 		contextActions: ExtensionContextActions,
@@ -1604,7 +1608,7 @@ export class ExtensionRunner {
 							reason:
 								kind === "timeout"
 									? `Extension ${extensionPath} timed out after ${timeoutMs}ms`
-									: `Extension ${extensionPath} failed: ${message}`,
+									: authorizationReason(`Extension ${extensionPath} failed: ${authorizationReason(message)}`),
 						};
 					},
 					signal,
