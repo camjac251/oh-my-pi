@@ -528,7 +528,8 @@ export class AskDialogComponent implements Component {
 	#measureHeight(width: number, termRows: number): number {
 		const maxHeight = Math.max(MIN_DIALOG_ROWS, Math.floor(termRows * DIALOG_HEIGHT_RATIO));
 		const chrome = 5; // topBorder + divider + divider + footer + bottomBorder
-		const tabBarRows = this.#hasSubmitTab() ? 1 : 0;
+		// Every question can gain a note-only Submit tab after the initial measurement.
+		const tabBarRows = this.#questions.length > 0 ? 1 : 0;
 		const mdTheme = getMarkdownTheme();
 		let needed = MIN_DIALOG_ROWS;
 		for (let index = 0; index < this.#questions.length; index++) {

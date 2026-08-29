@@ -1605,6 +1605,30 @@ describe("AskDialogComponent", () => {
 		expect(component.render(80).length).toBe(questionTab.length);
 	});
 
+	it("reserves height when a note adds the Submit tab", async () => {
+		const onPrompt = vi.fn().mockReturnValue(Promise.resolve("Additional context"));
+		const component = new AskDialogComponent(
+			[
+				{
+					id: "q1",
+					question:
+						"Choose the primary environment for this focused regression test before continuing with the remaining verification steps.",
+					options: [{ label: "Option A" }],
+				},
+			],
+			{ onSubmit: vi.fn(), onCancel: vi.fn(), onPrompt },
+		);
+		const width = 28;
+		const initialRows = component.render(width).length;
+
+		component.handleInput("n");
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(onPrompt).toHaveBeenCalledTimes(1);
+		expect(component.render(width).length).toBe(initialRows);
+	});
+
 	it("clears the custom answer when the Other prompt is submitted empty", async () => {
 		const onPrompt = vi.fn();
 		const onSubmit = vi.fn();
