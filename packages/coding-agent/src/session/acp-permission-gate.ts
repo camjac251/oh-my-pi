@@ -23,11 +23,17 @@ export const PERMISSION_OPTIONS: ClientBridgePermissionOption[] = [
 /** Permission options indexed by their wire identifiers; unknown IDs miss and fail closed. */
 export const PERMISSION_OPTIONS_BY_ID = new Map(PERMISSION_OPTIONS.map(option => [option.optionId, option]));
 
+export interface AcpApprovalLifecycle {
+	requested(): Promise<void>;
+	resolved(approved: boolean, reason?: string): Promise<void>;
+}
+
 type AcpApprovalScope = {
 	toolCallId: string;
 	toolName: string;
 	mode: "approved" | "required";
 	reason?: string;
+	lifecycle?: AcpApprovalLifecycle;
 };
 
 const acpApprovalScope = new AsyncLocalStorage<AcpApprovalScope>();
@@ -49,21 +55,47 @@ export function withRequiredAcpApproval<T>(
 	toolCallId: string,
 	toolName: string,
 	reason: string | undefined,
+	lifecycle: AcpApprovalLifecycle | undefined,
 	execute: () => Promise<T>,
 ): Promise<T> {
-	return acpApprovalScope.run({ toolCallId, toolName, mode: "required", ...(reason ? { reason } : {}) }, execute);
+	return acpApprovalScope.run(
+		{
+			toolCallId,
+			toolName,
+			mode: "required",
+			...(reason ? { reason } : {}),
+			...(lifecycle ? { lifecycle } : {}),
+		},
+		execute,
+	);
+}
+
+function requiredAcpApprovalScope(toolCallId: string, toolName: string): AcpApprovalScope | undefined {
+	const scope = acpApprovalScope.getStore();
+	return scope?.toolCallId === toolCallId && scope.toolName === toolName && scope.mode === "required"
+		? scope
+		: undefined;
 }
 
 export function requiresFreshAcpApproval(toolCallId: string, toolName: string): boolean {
-	const scope = acpApprovalScope.getStore();
-	return scope?.toolCallId === toolCallId && scope.toolName === toolName && scope.mode === "required";
+	return requiredAcpApprovalScope(toolCallId, toolName) !== undefined;
 }
 
 export function getRequiredAcpApprovalReason(toolCallId: string, toolName: string): string | undefined {
-	const scope = acpApprovalScope.getStore();
-	return scope?.toolCallId === toolCallId && scope.toolName === toolName && scope.mode === "required"
-		? scope.reason
-		: undefined;
+	return requiredAcpApprovalScope(toolCallId, toolName)?.reason;
+}
+
+export async function notifyRequiredAcpApprovalRequested(toolCallId: string, toolName: string): Promise<void> {
+	await requiredAcpApprovalScope(toolCallId, toolName)?.lifecycle?.requested();
+}
+
+export async function notifyRequiredAcpApprovalResolved(
+	toolCallId: string,
+	toolName: string,
+	approved: boolean,
+	reason?: string,
+): Promise<void> {
+	await requiredAcpApprovalScope(toolCallId, toolName)?.lifecycle?.resolved(approved, reason);
 }
 
 function getEditDestructiveIntent(args: unknown): { kind: "delete" | "move"; paths: string[] } | undefined {
