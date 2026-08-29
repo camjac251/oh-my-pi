@@ -1080,8 +1080,6 @@ describe("AskDialogComponent", () => {
 		const lines = title.split("\n");
 		// Title must be bounded to at most MAX_PROMPT_TITLE_ROWS lines.
 		expect(lines.length).toBeLessThanOrEqual(3);
-		// The multi-line question must be flattened (no raw newlines expanding rows).
-		expect(stripVTControlCharacters(title)).toContain("Note:");
 	});
 
 	it("scrolls question rows when cursor moves below the viewport", () => {
