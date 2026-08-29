@@ -1917,7 +1917,7 @@ export class ExtensionRunner {
 							reason:
 								kind === "timeout"
 									? `Extension ${extensionPath} timed out after ${timeoutMs}ms`
-									: `Extension ${extensionPath} failed: ${message}`,
+									: authorizationReason(`Extension ${extensionPath} failed: ${authorizationReason(message)}`),
 						};
 					},
 					signal,
