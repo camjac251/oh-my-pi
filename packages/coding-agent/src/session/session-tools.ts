@@ -32,6 +32,8 @@ import {
 	getPermissionIntent,
 	getRequiredAcpApprovalReason,
 	isApprovedAcpToolCall,
+	notifyRequiredAcpApprovalRequested,
+	notifyRequiredAcpApprovalResolved,
 	PERMISSION_OPTIONS,
 	PERMISSION_OPTIONS_BY_ID,
 	PERMISSION_REQUIRED_TOOLS,
@@ -777,6 +779,8 @@ export class SessionTools {
 					signal?.addEventListener("abort", onAbort, { once: true });
 					let raced: PermissionRaceResult;
 					try {
+						await notifyRequiredAcpApprovalRequested(toolCallId, target.name);
+						if (signal?.aborted) throw new ToolAbortError("Permission request cancelled");
 						const requiredApprovalReason = getRequiredAcpApprovalReason(toolCallId, target.name);
 						const permissionContent = [
 							...(requiredApprovalReason
@@ -808,19 +812,41 @@ export class SessionTools {
 							signal,
 						).then(outcome => ({ kind: "permission" as const, outcome }));
 						raced = await Promise.race([permissionPromise, abortPromise]);
+					} catch (error) {
+						await notifyRequiredAcpApprovalResolved(
+							toolCallId,
+							target.name,
+							false,
+							error instanceof Error ? error.message : "permission request failed",
+						);
+						throw error;
 					} finally {
 						signal?.removeEventListener("abort", onAbort);
 					}
 					if (raced.kind === "aborted" || signal?.aborted) {
+						await notifyRequiredAcpApprovalResolved(
+							toolCallId,
+							target.name,
+							false,
+							"permission request cancelled",
+						);
 						throw new ToolAbortError("Permission request cancelled");
 					}
 					const outcome = raced.outcome;
 					if (outcome.outcome === "cancelled") {
+						await notifyRequiredAcpApprovalResolved(
+							toolCallId,
+							target.name,
+							false,
+							"permission request cancelled",
+						);
 						throw new ToolAbortError("Permission request cancelled");
 					}
 					const selectedOption = PERMISSION_OPTIONS_BY_ID.get(outcome.optionId);
 					if (!selectedOption) {
-						throw new ToolError(`Tool permission response used unknown option ID: ${outcome.optionId}`);
+						const reason = `Tool permission response used unknown option ID: ${outcome.optionId}`;
+						await notifyRequiredAcpApprovalResolved(toolCallId, target.name, false, reason);
+						throw new ToolError(reason);
 					}
 					if (selectedOption.kind === "allow_always") {
 						this.#acpPermissionDecisions.set(permissionIntent.cacheKey, "allow_always");
@@ -828,8 +854,10 @@ export class SessionTools {
 						this.#acpPermissionDecisions.set(permissionIntent.cacheKey, "reject_always");
 					}
 					if (selectedOption.kind === "reject_once" || selectedOption.kind === "reject_always") {
+						await notifyRequiredAcpApprovalResolved(toolCallId, target.name, false, "denied by user");
 						throw new ToolError(`Tool call rejected by user (${target.name})`);
 					}
+					await notifyRequiredAcpApprovalResolved(toolCallId, target.name, true);
 					return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 				};
 			},

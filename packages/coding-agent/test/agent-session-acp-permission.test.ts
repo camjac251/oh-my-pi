@@ -304,6 +304,83 @@ it("extension ask uses one ACP permission request without form elicitation", asy
 	expect(bashTool.executeCalls).toBe(1);
 });
 
+it("extension ask emits approval lifecycle events around deferred ACP permission", async () => {
+	const order: string[] = [];
+	const approvalEvents: Array<Record<string, unknown>> = [];
+	const bashTool = makeFakeTool("bash");
+	bashTool.execute = async () => {
+		order.push("execute");
+		bashTool.executeCalls++;
+		return { content: [{ type: "text" as const, text: "ok" }] };
+	};
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission() {
+			order.push("requestPermission");
+			return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+		},
+	};
+	const runtime = new ExtensionRuntime();
+	const extension = await loadExtensionFromFactory(
+		pi => {
+			pi.on("tool_authorization", () => ({ decision: "ask", reason: "Confirm protected command" }));
+			pi.on("tool_approval_requested", event => {
+				order.push("requested");
+				approvalEvents.push({
+					type: event.type,
+					toolName: event.toolName,
+					toolCallId: event.toolCallId,
+					reason: event.reason,
+					approvalMode: event.approvalMode,
+				});
+			});
+			pi.on("tool_approval_resolved", event => {
+				order.push("resolved");
+				approvalEvents.push({
+					type: event.type,
+					toolName: event.toolName,
+					toolCallId: event.toolCallId,
+					approved: event.approved,
+					reason: event.reason,
+				});
+			});
+		},
+		tempDir.path(),
+		new EventBus(),
+		runtime,
+		"acp-final-authorization-lifecycle",
+	);
+	session = await createSession([bashTool], bridge, {}, { extension: { runtime, value: extension } });
+
+	await session.setActiveToolsByName(["bash"]);
+	const wrappedBash = session.agent.state.tools.find(tool => tool.name === "bash");
+	await wrappedBash!.execute(
+		"call-extension-lifecycle",
+		{ command: "echo hi" },
+		undefined,
+		undefined as never,
+		{ hasUI: false } as never,
+	);
+
+	expect(order).toEqual(["requested", "requestPermission", "resolved", "execute"]);
+	expect(approvalEvents).toEqual([
+		{
+			type: "tool_approval_requested",
+			toolName: "bash",
+			toolCallId: "call-extension-lifecycle",
+			reason: "Confirm protected command",
+			approvalMode: "yolo",
+		},
+		{
+			type: "tool_approval_resolved",
+			toolName: "bash",
+			toolCallId: "call-extension-lifecycle",
+			approved: true,
+			reason: undefined,
+		},
+	]);
+});
+
 it("extension ask includes its bounded reason in the ACP permission request", async () => {
 	const bashTool = makeFakeTool("bash");
 	const permissionRequests: ClientBridgePermissionToolCall[] = [];

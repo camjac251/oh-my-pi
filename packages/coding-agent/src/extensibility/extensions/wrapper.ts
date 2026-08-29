@@ -336,37 +336,38 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			getPermissionIntent(this.tool.name, effectiveParams) !== undefined;
 		const approvalReason =
 			extensionApprovalRequired && approvalCheck.reason ? approvalData(approvalCheck.reason) : approvalCheck.reason;
+		const hasApprovalHandlers =
+			this.runner.hasHandlers("tool_approval_requested") || this.runner.hasHandlers("tool_approval_resolved");
+		const sessionId = this.runner.sessionId;
+		const emitApprovalRequested = async () => {
+			if (!hasApprovalHandlers) return;
+			await this.runner.emit({
+				type: "tool_approval_requested",
+				sessionId,
+				toolName: this.tool.name,
+				toolCallId,
+				...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
+				approvalMode,
+			});
+		};
+		const emitApprovalResolved = async (approved: boolean, reason?: string) => {
+			if (!hasApprovalHandlers) return;
+			await this.runner.emit({
+				type: "tool_approval_resolved",
+				sessionId,
+				toolName: this.tool.name,
+				toolCallId,
+				approved,
+				...(reason ? { reason } : {}),
+			});
+		};
 
 		if (approvalCheck.required && !deferExtensionApprovalToAcp) {
 			if (matchesScheduledCall && !hasFinalAuthorization) {
 				await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
 			}
 
-			const hasApprovalHandlers =
-				this.runner.hasHandlers("tool_approval_requested") || this.runner.hasHandlers("tool_approval_resolved");
-			const sessionId = this.runner.sessionId;
-			if (hasApprovalHandlers) {
-				await this.runner.emit({
-					type: "tool_approval_requested",
-					sessionId,
-					toolName: this.tool.name,
-					toolCallId,
-					...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
-					approvalMode,
-				});
-			}
-
-			const emitApprovalResolved = async (approved: boolean, reason?: string) => {
-				if (!hasApprovalHandlers) return;
-				await this.runner.emit({
-					type: "tool_approval_resolved",
-					sessionId,
-					toolName: this.tool.name,
-					toolCallId,
-					approved,
-					...(reason ? { reason } : {}),
-				});
-			};
+			await emitApprovalRequested();
 
 			// Provider safety checks fail closed without an interactive prompt. Unlike
 			// ordinary tier approval, no setting or yolo mode may bypass this gate.
@@ -438,8 +439,17 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				withFileMutationSession(this.runner.sessionId, () => {
 					if (extensionApprovalGranted)
 						return withApprovedAcpToolCall(toolCallId, this.tool.name, executeTool);
-					if (deferExtensionApprovalToAcp)
-						return withRequiredAcpApproval(toolCallId, this.tool.name, approvalReason, executeTool);
+					if (deferExtensionApprovalToAcp) {
+						return withRequiredAcpApproval(
+							toolCallId,
+							this.tool.name,
+							approvalReason,
+							hasApprovalHandlers
+								? { requested: emitApprovalRequested, resolved: emitApprovalResolved }
+								: undefined,
+							executeTool,
+						);
+					}
 					return executeTool();
 				}),
 			);
