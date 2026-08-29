@@ -110,6 +110,12 @@ function authorizationReason(value: string): string {
 	return truncateToWidth(sanitized, TRUNCATE_LENGTHS.CONTENT);
 }
 
+function authorizationExtensionDiagnostic(extensionPath: string, detail: string): string {
+	const prefix = "Extension ";
+	const pathWidth = Math.max(1, TRUNCATE_LENGTHS.CONTENT - Bun.stringWidth(prefix) - Bun.stringWidth(detail));
+	return `${prefix}${truncateToWidth(extensionPath, pathWidth)}${detail}`;
+}
+
 /**
  * Dedicated cap for `session_shutdown` handlers. The generic 30s budget is
  * appropriate for events extensions can observe (e.g. `session_start`,
@@ -1590,7 +1596,7 @@ export class ExtensionRunner {
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get("tool_authorization");
 			if (!handlers || handlers.length === 0) continue;
-			const extensionPath = shortenPath(ext.path);
+			const extensionPath = authorizationReason(ext.path);
 
 			for (const handler of handlers) {
 				const handlerEvent = { ...event, input: structuredClone(event.input) };
@@ -1607,7 +1613,7 @@ export class ExtensionRunner {
 							decision: "deny" as const,
 							reason:
 								kind === "timeout"
-									? `Extension ${extensionPath} timed out after ${timeoutMs}ms`
+									? authorizationExtensionDiagnostic(extensionPath, ` timed out after ${timeoutMs}ms`)
 									: authorizationReason(`Extension ${extensionPath} failed: ${authorizationReason(message)}`),
 						};
 					},
@@ -1618,7 +1624,10 @@ export class ExtensionRunner {
 				if (!(["allow", "ask", "deny"] as const).includes(handlerResult.decision)) {
 					return {
 						decision: "deny",
-						reason: `Extension ${extensionPath} returned an unsupported tool authorization decision`,
+						reason: authorizationExtensionDiagnostic(
+							extensionPath,
+							" returned an unsupported tool authorization decision",
+						),
 					};
 				}
 				if (handlerResult.decision === "deny") {

@@ -304,6 +304,41 @@ it("extension ask uses one ACP permission request without form elicitation", asy
 	expect(bashTool.executeCalls).toBe(1);
 });
 
+it("combined native and extension asks use one ACP permission request", async () => {
+	const bashTool = makeFakeTool("bash");
+	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
+	const permissionSpy = spyOn(bridge, "requestPermission");
+	const runtime = new ExtensionRuntime();
+	const extension = await loadExtensionFromFactory(
+		pi => {
+			pi.on("tool_authorization", () => ({ decision: "ask", reason: "Confirm protected command" }));
+		},
+		tempDir.path(),
+		new EventBus(),
+		runtime,
+		"acp-final-authorization-combined-approval",
+	);
+	session = await createSession(
+		[bashTool],
+		bridge,
+		{ "tools.approvalMode": "write" },
+		{ extension: { runtime, value: extension } },
+	);
+
+	await session.setActiveToolsByName(["bash"]);
+	const wrappedBash = session.agent.state.tools.find(tool => tool.name === "bash");
+	await wrappedBash!.execute(
+		"call-combined-approval",
+		{ command: "echo hi" },
+		undefined,
+		undefined as never,
+		{ hasUI: false } as never,
+	);
+
+	expect(permissionSpy).toHaveBeenCalledTimes(1);
+	expect(bashTool.executeCalls).toBe(1);
+});
+
 it("extension ask emits approval lifecycle events around deferred ACP permission", async () => {
 	const order: string[] = [];
 	const approvalEvents: Array<Record<string, unknown>> = [];

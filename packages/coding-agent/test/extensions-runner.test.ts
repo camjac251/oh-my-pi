@@ -4090,6 +4090,12 @@ describe("ExtensionRunner", () => {
 			);
 
 			const result = await loadTestExtensions();
+			result.extensions[0]!.path = path.join(
+				homedir(),
+				".omp",
+				"extensions",
+				`unsafe\t\u001b[31m${"界".repeat(TRUNCATE_LENGTHS.CONTENT)}.ts`,
+			);
 			const runner = new ExtensionRunner(
 				result.extensions,
 				result.runtime,
@@ -4102,9 +4108,22 @@ describe("ExtensionRunner", () => {
 			const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ran" }] }));
 			const wrapped = new ExtensionToolWrapper({ ...createApprovalTool(), execute } as AgentTool, runner);
 
-			await expect(
-				wrapped.execute("call-authorization-timeout", {}, undefined, undefined, yoloContext),
-			).rejects.toThrow(`Extension ${extensionPath} timed out after 10ms`);
+			let thrown: Error | undefined;
+			try {
+				await wrapped.execute("call-authorization-timeout", {}, undefined, undefined, yoloContext);
+			} catch (error) {
+				if (!(error instanceof Error)) throw error;
+				thrown = error;
+			}
+
+			const message = thrown?.message ?? "";
+			expect(thrown).toBeDefined();
+			expect(message).toContain("timed out after 10ms");
+			expect(message).not.toContain(homedir());
+			expect(message).not.toContain("\t");
+			expect(message).not.toContain("\u001b");
+			expect(message).toContain("…");
+			expect(visibleWidth(message)).toBeLessThanOrEqual(TRUNCATE_LENGTHS.CONTENT);
 			expect(execute).not.toHaveBeenCalled();
 		});
 
@@ -4163,6 +4182,12 @@ describe("ExtensionRunner", () => {
 			fs.writeFileSync(path.join(extensionsDir, "tool-authorization-unsupported.ts"), extCode);
 
 			const result = await loadTestExtensions();
+			result.extensions[0]!.path = path.join(
+				homedir(),
+				".omp",
+				"extensions",
+				`unsafe\t\u001b[31m${"界".repeat(TRUNCATE_LENGTHS.CONTENT)}.ts`,
+			);
 			const runner = new ExtensionRunner(
 				result.extensions,
 				result.runtime,
@@ -4172,9 +4197,22 @@ describe("ExtensionRunner", () => {
 			);
 			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
 
-			await expect(
-				wrapped.execute("call-authorization-unsupported", {}, undefined, undefined, yoloContext),
-			).rejects.toThrow("unsupported tool authorization decision");
+			let thrown: Error | undefined;
+			try {
+				await wrapped.execute("call-authorization-unsupported", {}, undefined, undefined, yoloContext);
+			} catch (error) {
+				if (!(error instanceof Error)) throw error;
+				thrown = error;
+			}
+
+			const message = thrown?.message ?? "";
+			expect(thrown).toBeDefined();
+			expect(message).toContain("returned an unsupported tool authorization decision");
+			expect(message).not.toContain(homedir());
+			expect(message).not.toContain("\t");
+			expect(message).not.toContain("\u001b");
+			expect(message).toContain("…");
+			expect(visibleWidth(message)).toBeLessThanOrEqual(TRUNCATE_LENGTHS.CONTENT);
 		});
 
 		it("does not let final authorization bypass an explicit prompt policy", async () => {

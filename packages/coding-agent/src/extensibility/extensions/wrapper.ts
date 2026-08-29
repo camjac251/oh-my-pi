@@ -331,7 +331,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const deferExtensionApprovalToAcp =
 			this.hasAcpPermissionFallback &&
 			extensionApprovalRequired &&
-			!nativeApprovalRequired &&
+			pendingSafetyChecks.length === 0 &&
 			context?.hasUI !== true &&
 			getPermissionIntent(this.tool.name, effectiveParams) !== undefined;
 		const approvalReason =
