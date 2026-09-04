@@ -1363,6 +1363,7 @@ export class ExtensionRunner {
 											? active => this.reportToolApprovalAttention(authorizationToolCallId, active, "extension")
 											: undefined,
 									),
+								),
 							);
 						} catch (error) {
 							handlerFailure = { error };
