@@ -588,7 +588,6 @@ it("extension approval does not approve a nested tool that reuses the call ID", 
 		runtime,
 		"acp-final-authorization-tool-scope",
 	);
-	let xdev: XdevState;
 	let writeExecuteCalls = 0;
 	const writeTool: AgentTool = {
 		name: "write",
@@ -607,7 +606,7 @@ it("extension approval does not approve a nested tool that reuses the call ID", 
 		},
 	};
 	const tools = new Map([writeTool, deleteTool].map(tool => [tool.name, tool]));
-	xdev = {
+	const xdev: XdevState = {
 		tools,
 		mountedNames: new Set(["delete"]),
 		builtInNames: new Set(["write"]),
