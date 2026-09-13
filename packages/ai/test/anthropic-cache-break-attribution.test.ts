@@ -215,6 +215,47 @@ function grammarRejectedOnceFetch(sink: { bodies: string[] }): FetchImpl {
 	};
 }
 
+/**
+ * Rejects the first request of a turn with the 400 Anthropic returns when the
+ * model or account does not carry fast mode, then succeeds. The retry rebuilds
+ * the same turn without `speed`, and `speed` is not part of the cached prefix,
+ * so the rebuild changes nothing the attribution pass looks at — which makes it
+ * the clean way to ask what a rebuild reports about its own payload.
+ */
+function fastModeRejectedOnceFetch(sink: { bodies: string[] }): FetchImpl {
+	return async (input, init) => {
+		sink.bodies.push(typeof init?.body === "string" ? init.body : "");
+		if (sink.bodies.length === 1) {
+			return new Response(
+				JSON.stringify({
+					type: "error",
+					error: { type: "invalid_request_error", message: "This model does not support the speed parameter" },
+				}),
+				{ status: 400, headers: { "Content-Type": "application/json" } },
+			);
+		}
+		return await successFetch(input, init);
+	};
+}
+
+/** Fast mode is what the in-provider degradation retry below strips. */
+const PRIORITY: Pick<AnthropicOptions, "serviceTier"> = { serviceTier: "priority" };
+
+/**
+ * Payload hook that replaces the system prompt on the first attempt of a turn
+ * and leaves every later rebuild alone, the way a hook keyed on some external
+ * state does. The rejected attempt therefore sends a prompt the accepted one
+ * does not.
+ */
+function systemPromptOnFirstAttempt(text: string): NonNullable<AnthropicOptions["onPayload"]> {
+	let attempt = 0;
+	return payload => {
+		attempt += 1;
+		if (attempt > 1) return undefined;
+		return { ...(payload as Record<string, unknown>), system: [{ type: "text", text }] };
+	};
+}
+
 const stateMaps: Array<Map<string, ProviderSessionState>> = [];
 
 function createProviderSessionState(): Map<string, ProviderSessionState> {
@@ -229,7 +270,7 @@ async function turn(
 	cacheRetention?: CacheRetention,
 	model: Model<"anthropic-messages"> = MODEL,
 	fetch: FetchImpl = successFetch,
-	options: Pick<AnthropicOptions, "onPayload" | "sessionId" | "promptCacheKey"> = {},
+	options: Pick<AnthropicOptions, "onPayload" | "sessionId" | "promptCacheKey" | "serviceTier"> = {},
 ): Promise<AssistantMessage> {
 	return await streamAnthropic(model, context, {
 		apiKey: "sk-ant-api-test",
@@ -872,5 +913,77 @@ describe("anthropic cache-break attribution", () => {
 
 		expect(sentToolNames).toEqual(["_bash"]);
 		expect(second.cacheBreakReason).toEqual({ kind: "tools", tool: "bash" });
+	});
+
+	it("blames nothing when a degradation retry no longer carries the rejected attempt's change", async () => {
+		const states = createProviderSessionState();
+		const before = "You are a precise assistant.";
+		const after = "You are a precise assistant. Prefer short answers.";
+		const context = contextWithTools([tool("lookup", {})], before);
+		await turn(states, context, undefined, MODEL, successFetch, PRIORITY);
+		const sink = { bodies: [] as string[] };
+		// The hook edits the prompt only on the attempt that gets rejected. The
+		// rebuild sends the prompt the cached prefix already holds, so the turn
+		// that actually reached Anthropic changed nothing and must say so.
+		const second = await turn(states, context, undefined, MODEL, fastModeRejectedOnceFetch(sink), {
+			...PRIORITY,
+			onPayload: systemPromptOnFirstAttempt(after),
+		});
+		// The snapshot has to come from the accepted attempt: had the rejected
+		// one been stored, this unchanged turn would read as a prompt reverting
+		// from `after` back to `before`.
+		const third = await turn(states, context, undefined, MODEL, successFetch, PRIORITY);
+
+		// Without two really different payloads there is no misattribution to make.
+		expect(sink.bodies).toHaveLength(2);
+		expect(sink.bodies[0]).toContain(after);
+		expect(sink.bodies[1]).not.toContain(after);
+		expect(second.cacheBreakReason).toBeUndefined();
+		expect(third.cacheBreakReason).toBeUndefined();
+	});
+
+	it("still blames a change the successful attempt of a degradation retry carries", async () => {
+		const states = createProviderSessionState();
+		const before = "You are a precise assistant.";
+		const after = "You are a precise assistant. Prefer short answers.";
+		await turn(states, contextWithTools([tool("lookup", {})], before), undefined, MODEL, successFetch, PRIORITY);
+		const sink = { bodies: [] as string[] };
+		// The edit is the caller's own, so it survives the rebuild and is on the
+		// wire of the attempt that succeeded. Clearing attribution per rebuild
+		// must not turn into wiping it.
+		const second = await turn(
+			states,
+			contextWithTools([tool("lookup", {})], after),
+			undefined,
+			MODEL,
+			fastModeRejectedOnceFetch(sink),
+			PRIORITY,
+		);
+
+		expect(sink.bodies).toHaveLength(2);
+		expect(second.cacheBreakReason).toEqual({ kind: "system_prompt", charDelta: after.length - before.length });
+	});
+
+	it("keeps a control-state cause consumed before a degradation retry rebuilt the turn", async () => {
+		const states = createProviderSessionState();
+		await turn(states, contextWithTools([tool("lookup", {})]), undefined, MODEL, successFetch, PRIORITY);
+		const sink = { bodies: [] as string[] };
+		// The redefinition re-baselines the stable-tools plane on the first
+		// attempt, which both names `lookup` and updates the declared array. The
+		// rebuild finds the plane already re-baselined, so it can neither
+		// re-record the cause nor re-derive it from the payload: the declared
+		// array is the plane's own output on both sides of the comparison and is
+		// exempt. Only carrying the consumed cause forward keeps the tool named.
+		const second = await turn(
+			states,
+			contextWithTools([tool("lookup", { key: { type: "string" } })]),
+			undefined,
+			MODEL,
+			fastModeRejectedOnceFetch(sink),
+			PRIORITY,
+		);
+
+		expect(sink.bodies).toHaveLength(2);
+		expect(second.cacheBreakReason).toEqual({ kind: "tools", tool: "lookup" });
 	});
 });

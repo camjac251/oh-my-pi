@@ -2528,7 +2528,22 @@ const streamAnthropicOnce = (
 			// Committed only after the stream completes, so a turn that fails before
 			// a response leaves the previous snapshot in place for its retry.
 			let commitCacheBreakSnapshot: () => void = () => {};
+			// A baseline reset names its cause exactly once: `buildParams` consumes
+			// `pendingCacheBreakReason` on the first pass, so an in-provider
+			// degradation retry that rebuilds the same turn finds nothing there even
+			// though the reset it describes is still materialized in the payload
+			// being sent. That cause is carried across rebuilds; everything else the
+			// detector reports is read off the payload itself and belongs to the one
+			// attempt that produced it.
+			let consumedControlReason: CacheBreakReason | undefined;
 			const prepareParams = async (): Promise<MessageCreateParamsStreaming> => {
+				// Payload-derived attribution describes the attempt being built, and a
+				// rejected attempt's payload was never cached. Drop it before the
+				// rebuild rather than only overwriting it when the new pass finds
+				// something, or a retry whose payload no longer carries the change
+				// keeps reporting the rejected attempt's reason for the prompt that
+				// actually succeeded.
+				output.cacheBreakReason = undefined;
 				const built = buildParams(model, preparedContext, isOAuthToken, options, {
 					cacheIdentity,
 					compactionSupported,
@@ -2543,6 +2558,11 @@ const streamAnthropicOnce = (
 					fallbacks,
 					effectiveBaseUrl: baseUrl,
 				});
+				// `buildParams` clears the pending reset reason as it reads it, so a
+				// rebuild sees `undefined` for a reset that already happened. Latch
+				// it: the reset mutated the shared control state, and the controls it
+				// produced are replayed into every rebuild of this turn.
+				if (built.controlReason !== undefined) consumedControlReason = built.controlReason;
 				let nextParams = built.params;
 				if (disableStrictTools) {
 					dropAnthropicStrictTools(nextParams);
@@ -2582,14 +2602,12 @@ const streamAnthropicOnce = (
 					providerSessionState,
 					built.conversation,
 					nextParams,
-					built.controlReason,
+					consumedControlReason,
 					plannedToolsFingerprint,
 					disableStrictTools,
 				);
 				commitCacheBreakSnapshot = cacheBreak.commit;
-				// Degradation retries compare against the same uncommitted snapshot,
-				// but a consumed control reset may only name its cause on the first pass.
-				if (cacheBreak.reason !== undefined) output.cacheBreakReason = cacheBreak.reason;
+				output.cacheBreakReason = cacheBreak.reason;
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,
