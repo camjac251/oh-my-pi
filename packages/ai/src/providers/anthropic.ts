@@ -2463,6 +2463,12 @@ const streamAnthropicOnce = (
 			// Seeded from the session so a `cache_control` rejection learned on an
 			// earlier turn is honored on this turn's first attempt.
 			let dropCacheControl = providerSessionState?.cacheControlUnsupported ?? false;
+			// Set when this turn replayed because the endpoint refused
+			// `cache_control`. The endpoint-level latch is written from the turn's
+			// success path rather than from the parsed 400, so a misparsed error
+			// message costs one wasted retry instead of a whole session of
+			// suppressed prompt caching.
+			let cacheControlRejectionReplayed = false;
 			let dropAllThinking = false;
 			let prefixBindingRetryAttempted = false;
 			let prefixMismatchBehavior =
@@ -3582,9 +3588,7 @@ const streamAnthropicOnce = (
 							baseUrl,
 							error: streamFailureMessage,
 						});
-						if (providerSessionState) {
-							providerSessionState.cacheControlUnsupported = true;
-						}
+						cacheControlRejectionReplayed = true;
 						dropCacheControl = true;
 						// Rebuild the client too: the retry must stop advertising the
 						// extended-cache-ttl beta, and that lives in the default headers.
@@ -3659,6 +3663,13 @@ const streamAnthropicOnce = (
 			}
 			if (dropCacheControl) {
 				output.disabledFeatures = [...(output.disabledFeatures ?? []), "prompt-cache"];
+			}
+			// Latch the refusal only now that the breakpoint-free replay has
+			// actually carried a turn to completion. `isCacheControlUnsupported`
+			// classifies a free-text 400, so a misparse must not outlive the one
+			// request it cost.
+			if (cacheControlRejectionReplayed && providerSessionState) {
+				providerSessionState.cacheControlUnsupported = true;
 			}
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
