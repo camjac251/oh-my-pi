@@ -986,4 +986,81 @@ describe("anthropic cache-break attribution", () => {
 		expect(sink.bodies).toHaveLength(2);
 		expect(second.cacheBreakReason).toEqual({ kind: "tools", tool: "lookup" });
 	});
+
+	it("names the redefined tool on a turn whose re-baseline also dropped a recorded control", async () => {
+		const states = createProviderSessionState();
+		await turn(states, contextWithTools([tool("lookup", {}), tool("compute", {})]));
+		// `search` joins on a control transition, so this turn puts a synthetic
+		// system message on the wire that the next one will not have.
+		await turn(states, contextWithTools([tool("lookup", {}), tool("compute", {}), tool("search", {})]));
+		// Redefining `lookup` re-baselines the plane: it records `lookup` as the
+		// cause and clears the recorded transition in the same step. Counting
+		// the control message as history makes the previous wire history stop
+		// being a prefix of this one and buries the tool under a rewrite that
+		// never happened.
+		const third = await turn(
+			states,
+			contextWithTools([tool("lookup", { key: { type: "string" } }), tool("compute", {}), tool("search", {})]),
+		);
+
+		expect(third.cacheBreakReason).toEqual({ kind: "tools", tool: "lookup" });
+	});
+
+	it("reports the system-prompt edit that selected a fresh control state, not a rewrite", async () => {
+		const states = createProviderSessionState();
+		const before = "You are a precise assistant.";
+		const after = "You are a precise assistant. Prefer short answers.";
+		const tools = [tool("lookup", {}), tool("compute", {})];
+		await turn(states, contextWithTools(tools, before));
+		await turn(states, contextWithTools([...tools, tool("search", {})], before));
+		// The control-state key carries the system texts, so editing the prompt
+		// picks a fresh baseline whose transitions are empty — the control
+		// message simply stops being sent. The prompt is the cause and is
+		// already reported on its own dimension.
+		const third = await turn(states, contextWithTools([...tools, tool("search", {})], after));
+
+		expect(third.cacheBreakReason).toEqual({ kind: "system_prompt", charDelta: after.length - before.length });
+	});
+
+	it("drops a latched tool cause when the accepted rebuild sent the cached tool array", async () => {
+		const states = createProviderSessionState();
+		const cached: { tools: unknown } = { tools: undefined };
+		await turn(states, contextWithTools([tool("lookup", {})]), undefined, MODEL, successFetch, {
+			...PRIORITY,
+			onPayload: payload => {
+				const sent = payload as { tools: unknown };
+				cached.tools = sent.tools;
+				return undefined;
+			},
+		});
+		const sink = { bodies: [] as string[] };
+		let attempt = 0;
+		// The redefinition re-baselines the plane on the rejected attempt and
+		// latches `lookup`. The hook then puts the previously cached array back
+		// on the rebuild, so the payload that actually reached Anthropic
+		// declares exactly the tools the cached prefix already holds. Reporting
+		// the latched cause here would blame a change the wire never carried,
+		// and mislabel a turn that went cold for an unrelated reason.
+		const second = await turn(
+			states,
+			contextWithTools([tool("lookup", { key: { type: "string" } })]),
+			undefined,
+			MODEL,
+			fastModeRejectedOnceFetch(sink),
+			{
+				...PRIORITY,
+				onPayload: payload => {
+					attempt += 1;
+					if (attempt === 1) return undefined;
+					return { ...(payload as Record<string, unknown>), tools: cached.tools };
+				},
+			},
+		);
+
+		// Without two really different tool arrays there is no latch to misfire.
+		expect(sink.bodies).toHaveLength(2);
+		expect(sink.bodies[0]).toContain('"key":{"type":"string"}');
+		expect(sink.bodies[1]).not.toContain('"key":{"type":"string"}');
+		expect(second.cacheBreakReason).toBeUndefined();
+	});
 });

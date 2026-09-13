@@ -4236,9 +4236,59 @@ function anthropicControlMessageProjection(message: MessageParam): MessageParam 
 	return changed ? { ...message, content: projected } : message;
 }
 
+/**
+ * {@link anthropicControlMessageProjection} for the history chain, with the
+ * provider's own control declarations taken out. `undefined` means the message
+ * is nothing but control and does not belong in the chain at all.
+ *
+ * The chain answers "is the previous wire history a prefix of this one", and
+ * that question is only meaningful about conversation content. A control
+ * declaration is not content: it is derived from tool and effort state, and it
+ * appears, moves or vanishes as a consequence of something the other
+ * dimensions already name. {@link resetAnthropicControlState} is the case that
+ * forces the issue — a tool redefinition, or a system-prompt edit selecting a
+ * fresh control state, records its own cause and drops every recorded
+ * transition in the same step, so the previous request's chain holds a control
+ * message this one does not. A chain that counted it would answer
+ * `history_rewrite` for a re-baseline whose real cause is sitting right there.
+ *
+ * Three wire spellings carry control, and this drops all three: the synthetic
+ * `role: "system"` message {@link materializeAnthropicControlTransitions}
+ * splices in, the `tool_addition` / `tool_removal` blocks it appends to an
+ * adjacent system message instead, and the `output_config.effort` it sets
+ * there. None of those bytes can reach the wire as something a participant
+ * said: the plane above synthesizes them, and the only other producer is
+ * `walkSystemMessage` in `anthropic-messages-server.ts`, which decodes an
+ * inbound request's control messages into a developer payload
+ * `convertAnthropicMessages` re-emits verbatim — a relayed control
+ * declaration, still not conversation.
+ *
+ * Text in a system message survives, so a mid-conversation system message that
+ * merely had controls appended to it keeps its identity in the chain, and a
+ * turn-scoped one that stops being sent still reads as the rewrite it is.
+ */
+function anthropicHistoryMessageProjection(message: MessageParam): MessageParam | undefined {
+	if (message.role !== "system") return anthropicControlMessageProjection(message);
+	const { content } = message;
+	const blocks: readonly ContentBlockParam[] =
+		typeof content === "string" ? [{ type: "text", text: content }] : content;
+	const kept = blocks.filter(block => block.type !== "tool_addition" && block.type !== "tool_removal");
+	if (kept.length === 0) return undefined;
+	// Rebuilt field by field rather than spread: `output_config` is control and
+	// has to go, and a field added to `MessageParam` later is then classified
+	// deliberately instead of being inherited into the chain.
+	const projected: MessageParam = { role: "system", content: kept };
+	if (message.clear_at !== undefined) projected.clear_at = message.clear_at;
+	return anthropicControlMessageProjection(projected);
+}
+
 /** One request's view of the wire history, from a single pass over it. */
 type AnthropicHistoryChain = {
-	/** Messages the chain covers, excluding a trailing `Continue.` pad. */
+	/**
+	 * Messages the chain covers: the wire history minus a trailing `Continue.`
+	 * pad and minus everything {@link anthropicHistoryMessageProjection}
+	 * projected out, so the next request's `markAt` counts the same population.
+	 */
 	messageCount: number;
 	/** Chain over all of them, to store for the next request to compare against. */
 	chain: bigint;
@@ -4268,15 +4318,21 @@ type AnthropicHistoryChain = {
  * `supportsMidConversationSystem`, `supportsTurnScopedSystem`, and its
  * placement rules. Projecting them out instead would trade that for the one
  * failure this detection exists to remove: a genuinely cold turn with no cause
- * to report.
+ * to report. Control declarations are projected out — see {@link
+ * anthropicHistoryMessageProjection} — precisely because they are the opposite
+ * case: they never go unexplained.
  */
 function anthropicHistoryChain(messages: readonly MessageParam[], markAt: number): AnthropicHistoryChain {
-	const messageCount = anthropicStableMessageCount(messages);
+	const stableCount = anthropicStableMessageCount(messages);
 	let chain = 0n;
+	let messageCount = 0;
 	let mark = markAt === 0 ? chain : undefined;
-	for (let index = 0; index < messageCount; index++) {
-		chain = Bun.hash.wyhash(JSON.stringify(anthropicControlMessageProjection(messages[index])), chain);
-		if (index + 1 === markAt) mark = chain;
+	for (let index = 0; index < stableCount; index++) {
+		const projected = anthropicHistoryMessageProjection(messages[index]);
+		if (projected === undefined) continue;
+		chain = Bun.hash.wyhash(JSON.stringify(projected), chain);
+		messageCount++;
+		if (messageCount === markAt) mark = chain;
 	}
 	return { messageCount, chain, mark };
 }
@@ -4643,15 +4699,37 @@ const NO_CACHE_BREAK_DETECTION: AnthropicCacheBreakDetection = { reason: undefin
  * `history_rewrite` covers any wire history the previous one is not a prefix
  * of: a replaced root, an edited or removed middle message, a rewind, a branch
  * switch, a compaction — whether or not a control transition was ever recorded.
- * {@link syncAnthropicControlState} still catches the subset that has one,
- * earlier and together with the baseline reset that belongs to it; the general
- * case is the hash chain on the snapshot. {@link anthropicHistoryChain} replays
- * the chain over this request's own messages and reads its value at the
- * previous message count, so an append matches and anything else does not.
- * That pass measures 0.9 ms median / 2 ms worst case over a 1,838-message,
- * 3 MB wire history — the shape of a real 770k-token session — against a
- * request that already serializes the same payload and then spends seconds on
- * the wire, so cost is not a reason to narrow what this detects.
+ * The hash chain on the snapshot is the whole of it: {@link
+ * anthropicHistoryChain} replays the chain over this request's own messages
+ * and reads its value at the previous message count, so an append matches and
+ * anything else does not. That pass measures 0.9 ms median / 2 ms worst case
+ * over a 1,838-message, 3 MB wire history — the shape of a real 770k-token
+ * session — against a request that already serializes the same payload and
+ * then spends seconds on the wire, so cost is not a reason to narrow what this
+ * detects. {@link syncAnthropicControlState} records the same cause for the
+ * subset that has a recorded control under it, but that is a baseline reset
+ * first and a diagnostic second, and it is deliberately not consulted here:
+ * the anchor it found broken belongs to a real wire message, so the chain sees
+ * every rewrite the sent payload actually carries, and a rebuild whose payload
+ * no longer carries one would otherwise keep reporting it.
+ *
+ * Control declarations are outside the chain entirely ({@link
+ * anthropicHistoryMessageProjection}). A baseline reset clears the recorded
+ * transitions in the same step as it records its cause, so counting them would
+ * make the previous snapshot hold a control message the rebuilt request does
+ * not and answer `history_rewrite` ahead of the tool or system cause that
+ * actually explains the turn.
+ *
+ * The cause a reset recorded is latched across an in-provider degradation
+ * rebuild — `buildParams` consumes it once, and the tool it names is
+ * unrecoverable from a payload the plane's exemption silences — so it is
+ * revalidated against the payload that is actually being sent: a latched
+ * `tools` cause is reported only while the sent array still differs from the
+ * snapshot's. A hook that restored the previously sent array on the accepted
+ * attempt leaves nothing to blame, and this reports no cause rather than
+ * naming a change that never reached Anthropic. If such a turn does come back
+ * cold, the honest answer is that no dimension this compares changed — an
+ * expiry or an eviction — and a `tools` label would have been a false one.
  *
  * The chain starts at index 0, so it subsumes the conversation-root
  * fingerprint this used to store alongside it: a replaced root changes the
@@ -4755,11 +4833,16 @@ function detectAnthropicCacheBreak(
 		}
 	};
 	if (!previous) return { reason: undefined, commit };
-	if (controlReason?.kind === "history_rewrite") return { reason: controlReason, commit };
 	// `history.mark` is this request's chain over its own first
 	// `previous.messageCount` messages, and is absent when it no longer has
 	// that many. Equal means the previous history is a prefix of this one,
 	// which is an ordinary append and changes nothing already cached.
+	//
+	// A latched `history_rewrite` from {@link syncAnthropicControlState} is not
+	// consulted here and needs no separate branch: the anchor it found broken
+	// belongs to a real wire message, so a payload that still carries that
+	// rewrite fails this comparison on its own, and a rebuild whose payload no
+	// longer carries it must not be blamed for one.
 	if (history.mark !== previous.historyChain) return { reason: { kind: "history_rewrite" }, commit };
 	if (previous.systemFingerprint !== systemFingerprint) {
 		return {
@@ -4767,7 +4850,19 @@ function detectAnthropicCacheBreak(
 			commit,
 		};
 	}
-	if (controlReason) return { reason: controlReason, commit };
+	// The latched cause survives rebuilds of this turn only while the payload
+	// still shows the re-baseline it describes. The plane's exemption below
+	// cannot re-derive it — the declared array is the plane's own output on
+	// both sides — so the latch is the only thing that can name the tool; but a
+	// stateful payload hook that restored the previously sent array on the
+	// accepted attempt sent a prefix with no tool change in it at all, and
+	// naming one would mislabel a turn that went cold for some other reason.
+	if (
+		controlReason?.kind === "tools" &&
+		(previous.toolsPresent !== snapshot.toolsPresent || previous.toolsFingerprint !== toolsFingerprint)
+	) {
+		return { reason: controlReason, commit };
+	}
 	// The plane's exemption needs both arrays to have come from the plane and to
 	// have been stripped the same way; either half missing falls through to the
 	// fingerprints, which is the only thing that can speak for a rewrite the
