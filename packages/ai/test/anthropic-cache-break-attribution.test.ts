@@ -193,6 +193,28 @@ const rejectedFetch: FetchImpl = async () =>
 		headers: { "Content-Type": "application/json" },
 	});
 
+/**
+ * Rejects the first request of a turn with the compiled-grammar 400 Anthropic
+ * returns when a strict tool schema is too large, then succeeds. Records every
+ * serialized body, so a test can prove the retry really did strip `strict`
+ * instead of passing on an unchanged payload.
+ */
+function grammarRejectedOnceFetch(sink: { bodies: string[] }): FetchImpl {
+	return async (input, init) => {
+		sink.bodies.push(typeof init?.body === "string" ? init.body : "");
+		if (sink.bodies.length === 1) {
+			return new Response(
+				JSON.stringify({
+					type: "error",
+					error: { type: "invalid_request_error", message: "compiled grammar is too large" },
+				}),
+				{ status: 400, headers: { "Content-Type": "application/json" } },
+			);
+		}
+		return await successFetch(input, init);
+	};
+}
+
 const stateMaps: Array<Map<string, ProviderSessionState>> = [];
 
 function createProviderSessionState(): Map<string, ProviderSessionState> {
@@ -217,6 +239,30 @@ async function turn(
 		...(cacheRetention ? { cacheRetention } : {}),
 		...options,
 	}).result();
+}
+
+/**
+ * Drives a session up to and including the turn that learns the strict-tools
+ * drop, and returns that turn.
+ *
+ * A strict-eligible tool is declared at baseline and then leaves the active
+ * set, so the plane withdraws it with a `tool_removal` control and keeps
+ * declaring it — `strict` and all. The third turn's first attempt is rejected
+ * for the compiled grammar that declaration still produces, and the retry
+ * strips `strict` from the whole declared array. The withdrawn tool is not in
+ * the current array, so the plane's definition-key re-baseline never compares
+ * it and names nothing: only the prefix fingerprints can speak for the rewrite.
+ */
+async function learnStrictToolsDropMidTurn(
+	states: Map<string, ProviderSessionState>,
+	sink: { bodies: string[] },
+): Promise<AssistantMessage> {
+	// `bash` is on the strict allowlist, so its declaration really carries `strict`.
+	const strictEligible = tool("bash", { command: { type: "string" } });
+	const plain = tool("lookup", {});
+	await turn(states, contextWithTools([strictEligible, plain]));
+	await turn(states, contextWithTools([plain]));
+	return await turn(states, contextWithTools([plain]), undefined, MODEL, grammarRejectedOnceFetch(sink));
 }
 
 afterEach(() => {
@@ -261,6 +307,42 @@ describe("anthropic cache-break attribution", () => {
 		const second = await turn(states, contextWithTools([tool("lookup", {}), tool("search", {})]));
 
 		expect(second.cacheBreakReason).toBeUndefined();
+	});
+
+	it("blames the tool array on the turn that learns the strict-tools drop", async () => {
+		const states = createProviderSessionState();
+		const sink = { bodies: [] as string[] };
+		const learned = await learnStrictToolsDropMidTurn(states, sink);
+
+		// Without the retry really stripping `strict` off the declared array there
+		// would be no prefix rewrite left to report, and this would pass on an
+		// unchanged payload.
+		expect(sink.bodies[0]).toContain('"strict":true');
+		expect(sink.bodies[1]).not.toContain('"strict":true');
+		expect(learned.cacheBreakReason).toEqual({ kind: "tools" });
+	});
+
+	it("does not blame a tool added after the strict-tools drop was learned", async () => {
+		const states = createProviderSessionState();
+		await learnStrictToolsDropMidTurn(states, { bodies: [] });
+		// The array stays stripped from every later turn, so treating the strip
+		// as "not what the plane planned" would blame this turn — and every turn
+		// after it — instead of the one that actually changed. `search` joins on
+		// a `tool_addition` control here exactly as it does where the drop was
+		// never learned, and the declared array grows a `defer_loading` entry, so
+		// only the exemption can keep this silent. The conversation moves on
+		// first, so the new control lands at its own history slot rather than
+		// growing the one the earlier withdrawal already wrote.
+		const added = await turn(states, {
+			...contextWithTools([tool("lookup", {}), tool("search", {})]),
+			messages: [
+				{ role: "user", content: "Use the tools", timestamp: 1 },
+				assistantTurn([{ type: "text", text: "on it" }], 2),
+				{ role: "user", content: "now search", timestamp: 3 },
+			],
+		});
+
+		expect(added.cacheBreakReason).toBeUndefined();
 	});
 
 	it("blames the tool array on a deployment without mid-conversation tool changes", async () => {

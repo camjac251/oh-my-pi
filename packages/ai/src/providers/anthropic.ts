@@ -479,6 +479,17 @@ type AnthropicCachePrefixSnapshot = {
 	 * sides of it came from the plane.
 	 */
 	toolsPlanned: boolean;
+	/**
+	 * Whether the runtime-learned strict-tools fallback was active for this
+	 * request, i.e. whether {@link dropAnthropicStrictTools} ran over the array
+	 * the plane produced. That strip is not a plane-carried change — it rewrites
+	 * every declared tool the plane is replaying — so the plane's exemption only
+	 * holds between two requests that were stripped the same way. Recorded as
+	 * the provider's own decision rather than read back off the array, because a
+	 * plane-carried add of a strict-eligible tool flips what the array looks
+	 * like without changing strict mode at all.
+	 */
+	toolsStrictDropped: boolean;
 	/** Resolved retention; absent when the request carried no `cache_control` at all. */
 	cacheTtl?: "5m" | "1h";
 };
@@ -2551,6 +2562,14 @@ const streamAnthropicOnce = (
 				// exemption that keeps an ordinary add/remove silent would be dead.
 				// Only the `tools` subtree is walked here, so the post-hook pass
 				// stays the only full-payload walk per request.
+				//
+				// Taken after the strict-tools strip for the same reason: it must be
+				// the array the provider itself decided to send, or every turn on a
+				// deployment that has already learned the drop would read as a hook
+				// rewrite. The strip is still not a plane-carried change — it
+				// rewrites every declared tool the plane replays — so
+				// `disableStrictTools` travels with the fingerprint and gates the
+				// exemption there instead.
 				const plannedToolsFingerprint = built.toolPlaneEnabled
 					? anthropicToolsPrefixFingerprint(toWellFormedDeep(nextParams.tools) as typeof nextParams.tools)
 					: undefined;
@@ -2565,6 +2584,7 @@ const streamAnthropicOnce = (
 					nextParams,
 					built.controlReason,
 					plannedToolsFingerprint,
+					disableStrictTools,
 				);
 				commitCacheBreakSnapshot = cacheBreak.commit;
 				// Degradation retries compare against the same uncommitted snapshot,
@@ -4642,6 +4662,21 @@ const NO_CACHE_BREAK_DETECTION: AnthropicCacheBreakDetection = { reason: undefin
  * because the array changes back. Both sides of the comparison must have come
  * from the plane for it to stay silent, which is what `toolsPlanned` records.
  *
+ * `strictToolsDropped` is the second half of that condition. The fingerprint is
+ * captured after {@link dropAnthropicStrictTools}, so it describes what the
+ * provider decided to send rather than what `buildParams` assembled — the only
+ * way a deployment that has already learned the drop can agree with its own
+ * output. But the strip is not a plane-carried change: the plane replays its
+ * declared baseline, and a tool that carries `strict` there is not necessarily
+ * in the current active set, so the definition-key re-baseline in {@link
+ * planStableAnthropicTools} never sees it change and names nothing. Requiring
+ * the strip to match on both sides reports the turn that learns it — whose
+ * declared tools really are rewritten — while leaving a deployment already
+ * steady on the stripped array free to carry ordinary adds and removes
+ * silently. The flag is the provider's own decision, not `strict` read back off
+ * the array, because a plane-carried add of a strict-eligible tool changes what
+ * the array carries without changing strict mode.
+ *
  * Returns no reason when this conversation has no snapshot yet: the first
  * request of a conversation writes the prefix cold by definition and must never
  * be blamed on a change. A changed system prompt is detected here rather than in
@@ -4662,6 +4697,7 @@ function detectAnthropicCacheBreak(
 	params: MessageCreateParamsStreaming,
 	controlReason: CacheBreakReason | undefined,
 	plannedToolsFingerprint: string | undefined,
+	strictToolsDropped: boolean,
 ): AnthropicCacheBreakDetection {
 	if (!state) return NO_CACHE_BREAK_DETECTION;
 	const { system, tools } = params;
@@ -4689,6 +4725,7 @@ function detectAnthropicCacheBreak(
 		toolsFingerprint,
 		toolsPresent: tools !== undefined,
 		toolsPlanned,
+		toolsStrictDropped: strictToolsDropped,
 		...(cacheTtl ? { cacheTtl } : {}),
 	};
 	const commit = (): void => {
@@ -4713,9 +4750,14 @@ function detectAnthropicCacheBreak(
 		};
 	}
 	if (controlReason) return { reason: controlReason, commit };
+	// The plane's exemption needs both arrays to have come from the plane and to
+	// have been stripped the same way; either half missing falls through to the
+	// fingerprints, which is the only thing that can speak for a rewrite the
+	// plane cannot express as a control.
+	const toolsExempt = toolsPlanned && previous.toolsPlanned && previous.toolsStrictDropped === strictToolsDropped;
 	if (
 		previous.toolsPresent !== snapshot.toolsPresent ||
-		((!toolsPlanned || !previous.toolsPlanned) && previous.toolsFingerprint !== toolsFingerprint)
+		(!toolsExempt && previous.toolsFingerprint !== toolsFingerprint)
 	) {
 		return { reason: { kind: "tools" }, commit };
 	}
