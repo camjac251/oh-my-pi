@@ -51,6 +51,9 @@
 - Fixed prompts awaiting setup crossing a fork, branch, or tree-navigation commit, multi-question extension dialogs moving later questions to a replacement Collab room, and stale rooms blocking `/collab` or `/join` after a failed session change ([#11908](https://github.com/can1357/oh-my-pi/pull/11908) by [@alphastorm](https://github.com/alphastorm)).
 - Fixed background task cards missing their final completion or failure after an early result or live-session focus replay.
 - Ranged reads on Windows no longer intermittently open the selector-suffixed path when filesystem probes return transient errors ([#11284](https://github.com/can1357/oh-my-pi/issues/11284)).
+### Changed
+
+- The cache miss marker now names what broke the prefix on Anthropic turns, for example `cache miss · 52K tokens · system prompt changed (+40 chars)`. Enable it with `display.cacheMissMarker` ([#11813](https://github.com/can1357/oh-my-pi/pull/11813) by [@camjac251](https://github.com/camjac251)).
 
 ## [18.1.19] - 2026-09-12
 
@@ -72,10 +75,6 @@
 - `/debug` memory reports now keep large heap snapshots out of JavaScript strings and reject empty snapshots instead of saving zero-byte files ([#11785](https://github.com/can1357/oh-my-pi/issues/11785)).
 - Sloppy-mode edits now drop a copied `[N more lines in ...]` read notice the same way they already drop the other read-metadata rows, so a pasted projection can no longer leak into the matched pattern or the written text ([#11797](https://github.com/can1357/oh-my-pi/pull/11797) by [@vasyza](https://github.com/vasyza)).
 - `/usage` now honors a provider's configured `baseUrl` when checking credentials before any model has been discovered, so a proxy-scoped API key is no longer sent to the provider's canonical host ([#11656](https://github.com/can1357/oh-my-pi/pull/11656) by [@oldschoola](https://github.com/oldschoola)).
-
-### Changed
-
-- The cache miss marker now names what broke the prefix on Anthropic turns, for example `cache miss · 52K tokens · system prompt changed (+40 chars)`. Enable it with `display.cacheMissMarker` ([#11813](https://github.com/can1357/oh-my-pi/pull/11813) by [@camjac251](https://github.com/camjac251)).
 
 ### Fixed
 
