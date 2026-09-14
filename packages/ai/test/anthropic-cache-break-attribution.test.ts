@@ -74,6 +74,22 @@ const ESCAPED_TOOL_NAMES_MODEL: Model<"anthropic-messages"> = buildModel({
 	compat: { escapeBuiltinToolNames: true },
 });
 
+// Per-message effort arrives with Opus 5 (and Fable/Mythos 5.1) on the direct
+// endpoint, so an effort change there really becomes an `output_config` control
+// on a mid-conversation system message instead of a top-level field.
+const PER_MESSAGE_EFFORT_MODEL: Model<"anthropic-messages"> = buildModel({
+	id: "claude-opus-5",
+	name: "Claude Opus 5",
+	api: "anthropic-messages",
+	provider: "anthropic",
+	baseUrl: "https://api.anthropic.com",
+	reasoning: true,
+	input: ["text"],
+	cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 },
+	contextWindow: 200_000,
+	maxTokens: 8_192,
+});
+
 const SESSION_ID = "cache-break-attribution-session";
 
 function tool(name: string, properties: Record<string, unknown>): Tool {
@@ -155,6 +171,76 @@ const rewriteWireTools: NonNullable<AnthropicOptions["onPayload"]> = payload => 
 		),
 	};
 };
+
+/**
+ * Shape of a wire message as the hooks below read it: enough to find the
+ * `tool_addition` / `tool_removal` blocks and the per-message `output_config`
+ * the provider materializes for a control transition.
+ */
+type WireControlMessage = {
+	role: string;
+	content: string | Array<{ type: string; tool?: { type: string; name: string } }>;
+	output_config?: { effort?: string };
+};
+
+function mapWireMessages(
+	payload: unknown,
+	map: (message: WireControlMessage) => WireControlMessage,
+): Record<string, unknown> {
+	const assembled = payload as Record<string, unknown> & { messages: readonly WireControlMessage[] };
+	return { ...assembled, messages: assembled.messages.map(map) };
+}
+
+/**
+ * Payload hook that returns a replacement body whose `tool_addition` blocks
+ * name a different tool. Every other byte — message order, content, the tool
+ * array, the system blocks, retention — is the one `buildParams` assembled, so
+ * the declaration the plane materialized is the only difference between the
+ * assembled payload and the sent one.
+ */
+const rewriteWireToolAddition: NonNullable<AnthropicOptions["onPayload"]> = payload =>
+	mapWireMessages(payload, message =>
+		typeof message.content === "string"
+			? message
+			: {
+					...message,
+					content: message.content.map(block =>
+						block.type === "tool_addition" && block.tool
+							? { ...block, tool: { ...block.tool, name: "rewritten" } }
+							: block,
+					),
+				},
+	);
+
+/**
+ * Payload hook that returns a replacement body with every control block taken
+ * out, the way a hook that only understands text content would rewrite one.
+ * The declaring message stays where it was, so the blocks are the only thing
+ * that changed.
+ */
+const dropWireControlBlocks: NonNullable<AnthropicOptions["onPayload"]> = payload =>
+	mapWireMessages(payload, message =>
+		typeof message.content === "string"
+			? message
+			: {
+					...message,
+					content: message.content.filter(
+						block => block.type !== "tool_addition" && block.type !== "tool_removal",
+					),
+				},
+	);
+
+/**
+ * Payload hook that returns a replacement body whose per-message
+ * `output_config.effort` is rewritten wherever the provider set one. The
+ * declaring message is otherwise untouched.
+ */
+function rewriteWireEffort(effort: string): NonNullable<AnthropicOptions["onPayload"]> {
+	return payload =>
+		mapWireMessages(payload, message =>
+			message.output_config === undefined ? message : { ...message, output_config: { effort } },
+		);
+}
 
 const successFetch: FetchImpl = async () => {
 	const events = [
@@ -270,7 +356,10 @@ async function turn(
 	cacheRetention?: CacheRetention,
 	model: Model<"anthropic-messages"> = MODEL,
 	fetch: FetchImpl = successFetch,
-	options: Pick<AnthropicOptions, "onPayload" | "sessionId" | "promptCacheKey" | "serviceTier"> = {},
+	options: Pick<
+		AnthropicOptions,
+		"onPayload" | "sessionId" | "promptCacheKey" | "serviceTier" | "effort" | "thinkingEnabled"
+	> = {},
 ): Promise<AssistantMessage> {
 	return await streamAnthropic(model, context, {
 		apiKey: "sk-ant-api-test",
@@ -1062,5 +1151,85 @@ describe("anthropic cache-break attribution", () => {
 		expect(sink.bodies[0]).toContain('"key":{"type":"string"}');
 		expect(sink.bodies[1]).not.toContain('"key":{"type":"string"}');
 		expect(second.cacheBreakReason).toBeUndefined();
+	});
+
+	it("reports a hook-rewritten tool_addition block on a cached control message", async () => {
+		const states = createProviderSessionState();
+		const declared = { body: "" };
+		const sent = { body: "" };
+		await turn(states, contextWithTools([tool("lookup", {}), tool("compute", {})]));
+		// `search` joins on a control transition, so the wire history now carries
+		// a system message whose `tool_addition` block is part of the cached
+		// prefix. That turn itself is silent — see "does not blame a tool added
+		// or removed between requests".
+		const grown = contextWithTools([tool("lookup", {}), tool("compute", {}), tool("search", {})]);
+		await turn(states, grown, undefined, MODEL, capturingFetch(declared));
+		// The hook edits that block after the payload was assembled. The history
+		// chain projects control declarations out, so nothing else in the request
+		// compares these bytes and the turn would go cold with nothing to report.
+		const third = await turn(states, grown, undefined, MODEL, capturingFetch(sent), {
+			onPayload: rewriteWireToolAddition,
+		});
+
+		// Without the block really being declared and then really rewritten on
+		// the wire, there is no prefix change to attribute.
+		expect(declared.body).toContain('{"type":"tool_addition","tool":{"type":"tool_reference","name":"search"}}');
+		expect(sent.body).toContain('{"type":"tool_addition","tool":{"type":"tool_reference","name":"rewritten"}}');
+		expect(third.cacheBreakReason).toEqual({ kind: "history_rewrite" });
+	});
+
+	it("reports a hook that dropped the control blocks off a cached control message", async () => {
+		const states = createProviderSessionState();
+		const sent = { body: "" };
+		await turn(states, contextWithTools([tool("lookup", {}), tool("compute", {})]));
+		const grown = contextWithTools([tool("lookup", {}), tool("compute", {}), tool("search", {})]);
+		await turn(states, grown);
+		// The declaring message is control-only, so the projection drops it from
+		// the chain whether or not it still holds its blocks: emptying it is
+		// invisible to every other dimension while it still moves cached bytes.
+		const third = await turn(states, grown, undefined, MODEL, capturingFetch(sent), {
+			onPayload: dropWireControlBlocks,
+		});
+
+		expect(sent.body).not.toContain("tool_addition");
+		expect(third.cacheBreakReason).toEqual({ kind: "history_rewrite" });
+	});
+
+	it("reports a hook-rewritten per-message effort and stays silent for the plane's own", async () => {
+		const states = createProviderSessionState();
+		const declared = { body: "" };
+		const sent = { body: "" };
+		const context: Context = {
+			...contextWithTools([tool("lookup", {})]),
+			messages: [
+				{ role: "user", content: "Use the tools", timestamp: 1 },
+				assistantTurn([{ type: "text", text: "on it" }], 2),
+				{ role: "user", content: "keep going", timestamp: 3 },
+			],
+		};
+		const at = (
+			effort: "high" | "low",
+		): Pick<AnthropicOptions, "effort" | "thinkingEnabled"> & { onPayload?: undefined } => ({
+			thinkingEnabled: true,
+			effort,
+		});
+		await turn(states, context, undefined, PER_MESSAGE_EFFORT_MODEL, successFetch, at("high"));
+		// Lowering the effort is carried as an `output_config` control anchored
+		// before the latest user message rather than as a top-level change, and
+		// that is an ordinary plane-carried declaration: it must stay silent.
+		const second = await turn(states, context, undefined, PER_MESSAGE_EFFORT_MODEL, capturingFetch(declared), {
+			...at("low"),
+		});
+		// The plane replays the same control from here on, so the only thing that
+		// changes on this turn is the hook's rewrite of its effort.
+		const third = await turn(states, context, undefined, PER_MESSAGE_EFFORT_MODEL, capturingFetch(sent), {
+			...at("low"),
+			onPayload: rewriteWireEffort("max"),
+		});
+
+		expect(declared.body).toContain('{"role":"system","content":[],"output_config":{"effort":"low"}}');
+		expect(sent.body).toContain('{"role":"system","content":[],"output_config":{"effort":"max"}}');
+		expect(second.cacheBreakReason).toBeUndefined();
+		expect(third.cacheBreakReason).toEqual({ kind: "history_rewrite" });
 	});
 });

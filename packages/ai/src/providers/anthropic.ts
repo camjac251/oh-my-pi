@@ -101,6 +101,7 @@ import {
 	type MessageCreateParams,
 	type MessageCreateParamsStreaming,
 	type MessageParam,
+	type OutputConfig,
 	parseAnthropicInputTransformations,
 	type RawMessageStreamEvent,
 	THINKING_BINDING_CONTROLS_BETA,
@@ -468,6 +469,19 @@ type AnthropicCachePrefixSnapshot = {
 	 * value at {@link messageCount}: equal means it merely appended.
 	 */
 	historyChain: bigint;
+	/**
+	 * Fingerprint of the control declarations the sent history carried ({@link
+	 * anthropicControlDeclarationsFingerprint}). {@link historyChain} projects
+	 * those bytes out, so this is the only thing that compares them.
+	 */
+	controlFingerprint: string;
+	/**
+	 * Whether {@link controlFingerprint} describes the declarations the provider
+	 * itself materialized, rather than ones a payload hook rewrote afterwards.
+	 * The plane's exemption from the comparison only holds while both sides of
+	 * it were sent as planned.
+	 */
+	controlPlanned: boolean;
 	systemFingerprint: string;
 	systemTextLength: number;
 	toolsFingerprint: string;
@@ -2593,6 +2607,14 @@ const streamAnthropicOnce = (
 				const plannedToolsFingerprint = built.toolPlaneEnabled
 					? anthropicToolsPrefixFingerprint(toWellFormedDeep(nextParams.tools) as typeof nextParams.tools)
 					: undefined;
+				// Same capture for the control declarations the history chain
+				// projects out, and for the same reason: a hook that edits or drops
+				// one rewrites bytes the cached prefix holds, and nothing else in
+				// this request compares them. Unconditional, unlike the tool array
+				// — the declarations a hook can rewrite are not only the plane's
+				// own, and "sent as the provider materialized it" is meaningful
+				// wherever they came from.
+				const plannedControlFingerprint = anthropicControlDeclarationsFingerprint(nextParams.messages);
 				const replacementPayload = await options?.onPayload?.(nextParams, model);
 				if (replacementPayload !== undefined) {
 					nextParams = replacementPayload as typeof nextParams;
@@ -2604,6 +2626,7 @@ const streamAnthropicOnce = (
 					nextParams,
 					consumedControlReason,
 					plannedToolsFingerprint,
+					plannedControlFingerprint,
 					disableStrictTools,
 				);
 				commitCacheBreakSnapshot = cacheBreak.commit;
@@ -4282,6 +4305,78 @@ function anthropicHistoryMessageProjection(message: MessageParam): MessageParam 
 	return anthropicControlMessageProjection(projected);
 }
 
+/**
+ * The control declarations one wire message carries: the `tool_addition` /
+ * `tool_removal` blocks and the `output_config` it holds, together with the
+ * position it holds them at. Exactly the bytes {@link
+ * anthropicHistoryMessageProjection} takes out of the history chain, and
+ * nothing else — the two are the halves of one split, and this side exists so
+ * those bytes are still compared somewhere.
+ */
+type AnthropicControlDeclaration = {
+	/**
+	 * Wire index of the declaring message. Position is part of the cached
+	 * prefix: the same declaration anchored somewhere else rewrites the prompt
+	 * from that point on, so it must not hash alike.
+	 */
+	index: number;
+	/** Control blocks in wire order; empty for an effort-only declaration. */
+	blocks: ContentBlockParam[];
+	/** Per-message `output_config`; absent when the message carries none. */
+	output_config?: OutputConfig;
+};
+
+/**
+ * Read a wire history's control declarations, in order.
+ *
+ * Only `role: "system"` messages are read, because that is the only role
+ * {@link anthropicHistoryMessageProjection} strips control out of — control
+ * blocks anywhere else survive the projection and are already compared as part
+ * of the chain. Bounded by {@link anthropicStableMessageCount} so this counts
+ * the same population the chain does, and a declaration the plane anchored
+ * past a trailing `Continue.` pad is not compared against the turn that
+ * replaces the pad.
+ *
+ * An effort-only transition materializes as a system message with no content
+ * at all, so a declaration is anything carrying control blocks or an
+ * `output_config`, not just one carrying blocks.
+ */
+function anthropicControlDeclarations(messages: readonly MessageParam[]): AnthropicControlDeclaration[] {
+	const declarations: AnthropicControlDeclaration[] = [];
+	const stableCount = anthropicStableMessageCount(messages);
+	for (let index = 0; index < stableCount; index++) {
+		const message = messages[index];
+		if (message.role !== "system") continue;
+		const { content } = message;
+		const blocks =
+			typeof content === "string"
+				? []
+				: content.filter(block => block.type === "tool_addition" || block.type === "tool_removal");
+		if (blocks.length === 0 && message.output_config === undefined) continue;
+		declarations.push({
+			index,
+			blocks,
+			...(message.output_config === undefined ? {} : { output_config: message.output_config }),
+		});
+	}
+	return declarations;
+}
+
+/**
+ * Fingerprint of a whole history's control declarations. Taken once over the
+ * payload the provider materialized and once over the payload it sent, exactly
+ * as {@link anthropicToolsPrefixFingerprint} is, so a payload hook that
+ * rewrote a declaration in between shows up as a difference between the two.
+ *
+ * Lone-surrogate-normalized here rather than at the callsite, because only the
+ * sent payload passes through {@link toWellFormedDeep} and comparing a raw
+ * extract against a normalized one would differ on every turn. The extract is
+ * a handful of blocks, so normalizing it walks nothing of consequence.
+ */
+function anthropicControlDeclarationsFingerprint(messages: readonly MessageParam[]): string {
+	return String(Bun.hash(JSON.stringify(toWellFormedDeep(anthropicControlDeclarations(messages)))));
+}
+
 /** One request's view of the wire history, from a single pass over it. */
 type AnthropicHistoryChain = {
 	/**
@@ -4692,9 +4787,10 @@ const NO_CACHE_BREAK_DETECTION: AnthropicCacheBreakDetection = { reason: undefin
  * the request succeeds.
  *
  * Resolution order when several apply: `history_rewrite` (the whole tail moved,
- * so everything after it is cold anyway), then `system_prompt` (earliest block
- * in the prefix), then `tools`, then `retention` (the prefix text is unchanged
- * but its cache entry is not reusable).
+ * so everything after it is cold anyway) — from the chain, then from the
+ * control declarations the chain cannot see — then `system_prompt` (earliest
+ * block in the prefix), then `tools`, then `retention` (the prefix text is
+ * unchanged but its cache entry is not reusable).
  *
  * `history_rewrite` covers any wire history the previous one is not a prefix
  * of: a replaced root, an edited or removed middle message, a rewind, a branch
@@ -4714,11 +4810,42 @@ const NO_CACHE_BREAK_DETECTION: AnthropicCacheBreakDetection = { reason: undefin
  * no longer carries one would otherwise keep reporting it.
  *
  * Control declarations are outside the chain entirely ({@link
- * anthropicHistoryMessageProjection}). A baseline reset clears the recorded
- * transitions in the same step as it records its cause, so counting them would
- * make the previous snapshot hold a control message the rebuilt request does
- * not and answer `history_rewrite` ahead of the tool or system cause that
- * actually explains the turn.
+ * anthropicHistoryMessageProjection}) and get their own comparison instead
+ * ({@link anthropicControlDeclarationsFingerprint}), reported as
+ * `history_rewrite` because that is what a changed one is: bytes of a
+ * mid-history wire message, which the chain itself measured until the
+ * projection gave it a blind spot. Keeping them in the chain is the thing that
+ * cannot work — a baseline reset clears the recorded transitions in the same
+ * step as it records its cause, so the previous snapshot would hold a control
+ * message the rebuilt request does not and answer `history_rewrite` ahead of
+ * the tool or system cause that actually explains the turn. Narrowing the
+ * projection to the transitions a reset cleared cannot work either: the chain
+ * is only comparable because each request folds its own messages through the
+ * same pure function of the payload, and a projection reading control state
+ * would compare a snapshot chained under one state against a payload chained
+ * under another. So the dimension moves rather than narrows.
+ *
+ * `controlPlanned` is what keeps the ordinary path silent, and it is the same
+ * construction as `toolsPlanned`: the declarations the provider materialized
+ * are fingerprinted before the payload hook runs, so a request whose sent
+ * declarations equal its planned ones went out exactly as the plane meant it.
+ * The plane carrying an add, a removal or an effort change as a control, and a
+ * reset withdrawing every control it had recorded, are both planned on both
+ * sides of the comparison and therefore exempt — and the reset's own cause is
+ * reported on its own dimension. Nothing but something downstream of the plane
+ * can make sent and planned disagree, so an outside edit is the only thing
+ * this compares. The turn that stops hooking is compared too, because its
+ * predecessor was not planned, and a hook that rewrites the same way on every
+ * turn stays silent because the sent declarations stand still — the same
+ * both-directions behavior the tool array already has.
+ *
+ * A control-only system message relayed from an inbound request — the
+ * Anthropic-compatible server decodes one into a developer payload that
+ * `convertAnthropicMessages` re-emits — is planned on both sides as well, so a
+ * caller that stops sending one is not reported. That is the hole this leaves
+ * open, and closing it would cost the exemption: the payload cannot say which
+ * declarations the plane authored, and a comparison that ignores provenance
+ * blames every ordinary add and removal.
  *
  * The cause a reset recorded is latched across an in-provider degradation
  * rebuild — `buildParams` consumes it once, and the tool it names is
@@ -4793,6 +4920,7 @@ function detectAnthropicCacheBreak(
 	params: MessageCreateParamsStreaming,
 	controlReason: CacheBreakReason | undefined,
 	plannedToolsFingerprint: string | undefined,
+	plannedControlFingerprint: string,
 	strictToolsDropped: boolean,
 ): AnthropicCacheBreakDetection {
 	if (!state) return NO_CACHE_BREAK_DETECTION;
@@ -4805,6 +4933,11 @@ function detectAnthropicCacheBreak(
 	// Equal means the plane produced what was sent; unequal means a payload hook
 	// rewrote the array afterwards, and absent means there is no plane at all.
 	const toolsPlanned = plannedToolsFingerprint === toolsFingerprint;
+	const controlFingerprint = anthropicControlDeclarationsFingerprint(params.messages);
+	// Same reading as `toolsPlanned`: equal means the provider's own
+	// materialization is what went out, unequal means something after it — a
+	// payload hook — rewrote a declaration.
+	const controlPlanned = plannedControlFingerprint === controlFingerprint;
 	// An absent `ttl` is the API's 5-minute default; `cacheControl` itself is
 	// absent when caching is off, and then there is no retention to record —
 	// switching caching on later is not a retention change.
@@ -4816,6 +4949,8 @@ function detectAnthropicCacheBreak(
 	const snapshot: AnthropicCachePrefixSnapshot = {
 		messageCount: history.messageCount,
 		historyChain: history.chain,
+		controlFingerprint,
+		controlPlanned,
 		systemFingerprint,
 		systemTextLength,
 		toolsFingerprint,
@@ -4844,6 +4979,15 @@ function detectAnthropicCacheBreak(
 	// rewrite fails this comparison on its own, and a rebuild whose payload no
 	// longer carries it must not be blamed for one.
 	if (history.mark !== previous.historyChain) return { reason: { kind: "history_rewrite" }, commit };
+	// The declarations the chain projected out, compared here instead. Exempt
+	// only while both requests went out as the provider planned them, which is
+	// true of every plane-carried change and of a reset withdrawing the
+	// controls it had recorded — the cases that must stay silent and whose
+	// causes are named elsewhere. Reported as the rewrite it is: these are
+	// bytes of a mid-history wire message.
+	if (!(controlPlanned && previous.controlPlanned) && previous.controlFingerprint !== controlFingerprint) {
+		return { reason: { kind: "history_rewrite" }, commit };
+	}
 	if (previous.systemFingerprint !== systemFingerprint) {
 		return {
 			reason: { kind: "system_prompt", charDelta: systemTextLength - previous.systemTextLength },
