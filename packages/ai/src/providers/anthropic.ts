@@ -481,14 +481,25 @@ type AnthropicCachePrefixSnapshot = {
 	/**
 	 * Third chain over the control declarations {@link historyChain} projects
 	 * out ({@link anthropicControlDeclarationImage}), read by the next request
-	 * at its own bound: every declaration anchored at or before the {@link
-	 * messageCount}-th chained message, which is the extent of this payload.
-	 * Those bytes sit inside the cached prefix and nothing else in the request
-	 * compares them, so a rewritten declaration is observable here and nowhere
-	 * else — while one declared past this prefix, which cannot have invalidated
-	 * it, stays outside the comparison.
+	 * at the bound {@link AnthropicHistoryChain.controlMark} describes: the
+	 * leading {@link controlCount} declarations, each anchored at or before the
+	 * {@link messageCount}-th chained message. Both halves of that bound are
+	 * this payload's own extent, so what the next request compares is exactly
+	 * the declarations this one sent. Those bytes sit inside the cached prefix
+	 * and nothing else in the request compares them, so a rewritten declaration
+	 * is observable here and nowhere else — while one declared past this
+	 * prefix, which cannot have invalidated it, stays outside the comparison.
 	 */
 	controlChain: bigint;
+	/**
+	 * Declarations folded into {@link controlChain}, which is where this
+	 * payload's wire boundary sits in the declaration sequence. {@link
+	 * messageCount} cannot stand in for it: a control-only message is outside
+	 * the chain and so never advances that count, which leaves the declaration
+	 * a payload hook appends after the whole history anchored exactly where
+	 * this payload's own trailing one is.
+	 */
+	controlCount: number;
 	/**
 	 * Whether every declaration this payload carried is one the provider itself
 	 * materialized, rather than one a payload hook rewrote afterwards ({@link
@@ -4528,9 +4539,27 @@ type AnthropicHistoryChain = {
 	 */
 	controlChain: bigint;
 	/**
-	 * {@link controlChain} over the declarations anchored inside the first
-	 * `markAt` chained messages, which is the extent of the previous request's
-	 * own payload.
+	 * Declarations folded into {@link controlChain}. Stored beside it because it
+	 * is the other half of the bound: it is where this payload's wire boundary
+	 * sits in the declaration sequence, which no count of chained messages can
+	 * express — a control-only message is outside the chain, so one appended
+	 * after the whole history carries the same anchor as the trailing
+	 * declaration the history already held.
+	 */
+	controlCount: number;
+	/**
+	 * {@link controlChain} over the declarations the previous request's own
+	 * payload carried: the first `controlMarkAt` of them, each anchored inside
+	 * the first `markAt` chained messages.
+	 *
+	 * Two bounds because the boundary has two coordinates and one of them
+	 * cannot see it. `markAt` is the extent of the cached prefix in messages,
+	 * which keeps a declaration the plane anchored past it out of the
+	 * comparison; `controlMarkAt` is the same boundary counted in declarations,
+	 * which is the only thing that distinguishes the trailing declaration the
+	 * previous payload sent from a further one appended after it at the same
+	 * anchor. Both are monotone over the pass, so the pair still reads a
+	 * prefix of the fold rather than a subsequence of it.
 	 *
 	 * Never `undefined`, unlike the two marks above: a prefix carrying no
 	 * declaration at all is the empty fold, which is exactly what the previous
@@ -4576,28 +4605,48 @@ type AnthropicHistoryChain = {
  * single turn.
  *
  * The control declarations the projection removed are folded into a third
- * chain over the same pass, bounded the same way rather than compared whole.
- * They need the bound for the reason the marks themselves exist: {@link
+ * chain over the same pass, bounded rather than compared whole. They need a
+ * bound for the reason the marks themselves exist: {@link
  * planStableAnthropicTools} records a transition at the end of the wire
  * history, so a tool arriving alongside a new user turn declares itself past
  * everything the previous request sent, and a whole-history comparison would
- * read those bytes as a rewrite of a prefix they sit after. They are not a
- * fourth population — {@link anthropicControlDeclarationImage} anchors each
- * one in the chain's own count, so `markAt` measures both in the same unit.
+ * read those bytes as a rewrite of a prefix they sit after.
  *
- * A declaration anchored at exactly `markAt` is inside the bound. It sits
- * after the last message the previous request chained, which is where the
- * end-of-history placement above puts a transition, so that slot holds the
- * previous payload's own trailing declarations — bytes the cached prefix
- * really did carry. This turn's own declarations cannot land there: the
- * messages it appended have already moved the count past `markAt` by the time
- * the plane anchors one.
+ * That bound takes two numbers, because the previous payload's wire boundary
+ * has two coordinates and neither one alone preserves it.
+ *
+ * `markAt` is the boundary in messages. {@link
+ * anthropicControlDeclarationImage} anchors each declaration in the chain's
+ * own count, so the two are measured in one unit, and a declaration anchored
+ * past `markAt` is one no cached prefix could have held. The bound includes
+ * `markAt` itself: the end-of-history placement above puts a transition right
+ * there, so that slot is where the previous payload's own trailing
+ * declarations live.
+ *
+ * `controlMarkAt` is the same boundary in declarations, and it is what tells
+ * the two inhabitants of that slot apart. A control-only message is outside
+ * the chain, so appending one moves no anchor: the declaration a payload hook
+ * adds after the entire history carries exactly the anchor the previous
+ * payload's trailing declaration carries, and the message coordinate cannot
+ * separate them. How many declarations the previous payload actually sent can
+ * — the ones it sent are the leading `controlMarkAt` of this payload's, and
+ * anything beyond them arrived afterwards.
+ *
+ * Both conditions are monotone over the pass — `messageCount` only grows and
+ * so does the declaration count — so the pair reads a prefix of the fold, not
+ * a subsequence of it, and `controlMark` stays comparable against the whole
+ * fold the previous request stored.
  */
-function anthropicHistoryChain(messages: readonly MessageParam[], markAt: number): AnthropicHistoryChain {
+function anthropicHistoryChain(
+	messages: readonly MessageParam[],
+	markAt: number,
+	controlMarkAt: number,
+): AnthropicHistoryChain {
 	const stableCount = anthropicStableMessageCount(messages);
 	let chain = 0n;
 	let thinkingChain = 0n;
 	let controlChain = 0n;
+	let controlCount = 0;
 	let controlMark = 0n;
 	let messageCount = 0;
 	let mark = markAt === 0 ? chain : undefined;
@@ -4621,9 +4670,10 @@ function anthropicHistoryChain(messages: readonly MessageParam[], markAt: number
 		const declaration = anthropicControlDeclarationImage(message, messageCount);
 		if (declaration === undefined) continue;
 		controlChain = Bun.hash.wyhash(declaration, controlChain);
-		if (messageCount <= markAt) controlMark = controlChain;
+		controlCount++;
+		if (controlCount <= controlMarkAt && messageCount <= markAt) controlMark = controlChain;
 	}
-	return { messageCount, chain, mark, thinkingChain, thinkingMark, controlChain, controlMark };
+	return { messageCount, chain, mark, thinkingChain, thinkingMark, controlChain, controlCount, controlMark };
 }
 
 /**
@@ -5007,16 +5057,18 @@ const NO_CACHE_BREAK_DETECTION: AnthropicCacheBreakDetection = { reason: undefin
  *
  * Control declarations are outside the chain entirely ({@link
  * anthropicHistoryMessageProjection}) and get a third chain of their own
- * beside it ({@link anthropicControlDeclarationImage}), read at the same mark
- * and reported as `history_rewrite` because that is what a changed one is:
- * bytes of a mid-history wire message, which the chain itself measured until
- * the projection gave it a blind spot. A chain and not a whole-history
+ * beside it ({@link anthropicControlDeclarationImage}), read at their own
+ * bound and reported as `history_rewrite` because that is what a changed one
+ * is: bytes of a mid-history wire message, which the chain itself measured
+ * until the projection gave it a blind spot. A chain and not a whole-history
  * fingerprint, for the same reason the other two are: the plane anchors a new
  * declaration at the end of the wire history, so a tool arriving alongside a
  * new user turn adds bytes past everything already cached, and comparing whole
  * histories would call that a rewritten prefix. Bounded to the previous
- * message count, only a declaration the previous payload actually carried can
- * report, and a changed one that sits after it is what it is: an append.
+ * payload's extent in both coordinates — its message count and its declaration
+ * count, see {@link AnthropicHistoryChain.controlMark} — only a declaration
+ * that payload actually carried can report, and a changed one that sits after
+ * it is what it is: an append.
  *
  * Keeping them in the chain is the thing that cannot work — a baseline reset
  * clears the recorded transitions in the same step as it records its cause, so
@@ -5188,12 +5240,13 @@ function detectAnthropicCacheBreak(
 	const cacheTtl = cacheControl ? (cacheControl.ttl === "1h" ? "1h" : "5m") : undefined;
 	const { conversationKey } = conversation;
 	const previous = state.cachePrefixDiagnostics.get(conversationKey);
-	const history = anthropicHistoryChain(params.messages, previous?.messageCount ?? 0);
+	const history = anthropicHistoryChain(params.messages, previous?.messageCount ?? 0, previous?.controlCount ?? 0);
 	const snapshot: AnthropicCachePrefixSnapshot = {
 		messageCount: history.messageCount,
 		historyChain: history.chain,
 		thinkingChain: history.thinkingChain,
 		controlChain: history.controlChain,
+		controlCount: history.controlCount,
 		controlPlanned,
 		systemFingerprint,
 		systemTextLength,
@@ -5224,16 +5277,20 @@ function detectAnthropicCacheBreak(
 	// longer carries it must not be blamed for one.
 	if (history.mark !== previous.historyChain) return { reason: { kind: "history_rewrite" }, commit };
 	// The declarations the chain projected out, compared here instead — through
-	// the same mark the chain itself uses, so only a declaration anchored
-	// inside the previously cached prefix can speak. One that arrived past it,
-	// alongside this turn's own appended messages, cannot have invalidated
-	// anything already cached, and reporting it would mislabel a turn that went
-	// cold on expiry. Exempt, on top of the bound, while both requests went out
-	// as the provider planned them: that covers every plane-carried change and
-	// a reset withdrawing the controls it had recorded — the cases that must
-	// stay silent and whose causes are named elsewhere. What is left is
-	// reported as the rewrite it is: these are bytes of a mid-history wire
-	// message.
+	// the bound the previous payload's own extent defines, so only a
+	// declaration that payload actually carried can speak: anchored inside the
+	// messages it cached, and among the first `previous.controlCount` of them.
+	// The count is the half of that the messages cannot supply — a control-only
+	// message is outside the chain, so one a hook appends after the entire
+	// history anchors exactly where the previous payload's trailing declaration
+	// does. Either way a declaration that arrived past the boundary cannot have
+	// invalidated anything already cached, and reporting it would mislabel a
+	// turn that went cold on expiry. Exempt, on top of the bound, while both
+	// requests went out as the provider planned them: that covers every
+	// plane-carried change and a reset withdrawing the controls it had recorded
+	// — the cases that must stay silent and whose causes are named elsewhere.
+	// What is left is reported as the rewrite it is: these are bytes of a
+	// mid-history wire message.
 	if (!(controlPlanned && previous.controlPlanned) && history.controlMark !== previous.controlChain) {
 		return { reason: { kind: "history_rewrite" }, commit };
 	}

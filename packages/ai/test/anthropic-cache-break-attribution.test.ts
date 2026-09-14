@@ -230,6 +230,32 @@ const rewriteWireToolAddition: NonNullable<AnthropicOptions["onPayload"]> = payl
 	);
 
 /**
+ * Payload hook that returns a replacement body with one more control-only
+ * `role: "system"` message after the whole history, the way a gateway that
+ * declares a tool of its own does. It adds no chain-visible message, so the
+ * history chain cannot see it at all, and the bytes it adds sit after every
+ * message the previous request sent.
+ */
+const appendWireControlDeclaration = (payload: unknown): Record<string, unknown> => {
+	const assembled = payload as Record<string, unknown> & { messages: readonly WireControlMessage[] };
+	return {
+		...assembled,
+		messages: [
+			...assembled.messages,
+			{ role: "system", content: [{ type: "tool_addition", tool: { type: "tool_reference", name: "hooked" } }] },
+		],
+	};
+};
+
+/**
+ * {@link rewriteWireToolAddition} and {@link appendWireControlDeclaration} in
+ * one hook, in that order, so the appended declaration keeps its own name and
+ * the cached one is the only rewritten byte.
+ */
+const rewriteAndAppendWireControlDeclaration: NonNullable<AnthropicOptions["onPayload"]> = payload =>
+	appendWireControlDeclaration(rewriteWireToolAddition(payload));
+
+/**
  * Payload hook that returns a replacement body with every control block taken
  * out, the way a hook that only understands text content would rewrite one.
  * The declaring message stays where it was, so the blocks are the only thing
@@ -1515,6 +1541,73 @@ describe("anthropic cache-break attribution", () => {
 		expect(sent.body).toContain('{"type":"tool_addition","tool":{"type":"tool_reference","name":"rewritten"}}');
 		expect(sent.body.indexOf('"rewritten"')).toBeLessThan(sent.body.indexOf("follow-up 1"));
 		expect(fourth.cacheBreakReason).toEqual({ kind: "history_rewrite" });
+	});
+
+	it("does not report a control-only declaration a hook appended after the cached history", async () => {
+		const states = createProviderSessionState();
+		const sent = { body: "" };
+		await turn(states, contextWithTools([tool("lookup", {}), tool("compute", {})]));
+		// `search` joins on a control transition, so the plane's own declaration
+		// rides the end of the wire history from here on and the next turn
+		// inherits it as a cached byte.
+		const grown = contextWithTools([tool("lookup", {}), tool("compute", {}), tool("search", {})]);
+		await turn(states, grown);
+		// The hook adds a control-only system message of its own after the whole
+		// history. It is outside the chain, and it adds no chained message, so
+		// the declaration count is the only thing that separates it from the
+		// plane's trailing one — which the turn above really did cache and this
+		// turn replays untouched. Nothing already cached moved, so a cold turn
+		// here is an expiry with no cause to name.
+		const third = await turn(states, grown, undefined, MODEL, capturingFetch(sent), {
+			onPayload: appendWireControlDeclaration,
+		});
+
+		// Without the hook's declaration really being sent, and really sitting
+		// after the plane's own, there is nothing for the bound to keep quiet
+		// about.
+		expect(sent.body).toContain('{"type":"tool_addition","tool":{"type":"tool_reference","name":"hooked"}}');
+		expect(sent.body.indexOf('"hooked"')).toBeGreaterThan(
+			sent.body.indexOf('{"type":"tool_addition","tool":{"type":"tool_reference","name":"search"}}'),
+		);
+		expect(third.cacheBreakReason).toBeUndefined();
+	});
+
+	it("reports a hook-rewritten cached declaration on a turn whose hook also appended one", async () => {
+		const states = createProviderSessionState();
+		const sent = { body: "" };
+		await turn(states, contextWithTools([tool("lookup", {}), tool("compute", {})]));
+		const grown = contextWithTools([tool("lookup", {}), tool("compute", {}), tool("search", {})]);
+		await turn(states, grown);
+		// Same append as above, plus a rewrite of the declaration the previous
+		// turn cached. The appended one must not fill the bound in place of the
+		// cached one and hide the rewrite behind it.
+		const third = await turn(states, grown, undefined, MODEL, capturingFetch(sent), {
+			onPayload: rewriteAndAppendWireControlDeclaration,
+		});
+
+		expect(sent.body).toContain('{"type":"tool_addition","tool":{"type":"tool_reference","name":"rewritten"}}');
+		expect(sent.body).toContain('{"type":"tool_addition","tool":{"type":"tool_reference","name":"hooked"}}');
+		expect(third.cacheBreakReason).toEqual({ kind: "history_rewrite" });
+	});
+
+	it("blames nothing when a payload hook rewrites a cached declaration the same way on every turn", async () => {
+		const states = createProviderSessionState();
+		await turn(states, contextWithTools([tool("lookup", {}), tool("compute", {})]));
+		const grown = contextWithTools([tool("lookup", {}), tool("compute", {}), tool("search", {})]);
+		await turn(states, grown);
+		// The hook rewrites the plane's declaration on this turn and the next,
+		// so the declaration the fourth turn sends is byte-identical to the one
+		// the third turn cached. Neither turn is planned, so the exemption is
+		// off and the bound is the only thing answering: it has to read the
+		// declaration that sits at the boundary itself, not skip over it,
+		// because skipping leaves the empty fold to compare against a prefix
+		// that carried one and reports a rewrite nobody made.
+		await turn(states, grown, undefined, MODEL, successFetch, { onPayload: rewriteWireToolAddition });
+		const fourth = await turn(states, grown, undefined, MODEL, successFetch, {
+			onPayload: rewriteWireToolAddition,
+		});
+
+		expect(fourth.cacheBreakReason).toBeUndefined();
 	});
 
 	it("reports a hook-rewritten thinking block on a prior assistant turn", async () => {
