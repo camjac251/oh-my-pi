@@ -242,27 +242,41 @@ function rewriteWireEffort(effort: string): NonNullable<AnthropicOptions["onPayl
 		);
 }
 
-const successFetch: FetchImpl = async () => {
-	const events = [
-		{
-			type: "message_start",
-			message: {
-				id: "msg_cache_break",
-				usage: { input_tokens: 4, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
-			},
-		},
-		{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
-		{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
-		{ type: "content_block_stop", index: 0 },
-		{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
-		{ type: "message_stop" },
-	];
-	const body = `${events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}`).join("\n\n")}\n\n`;
+/**
+ * `message_start` is the acceptance boundary: it carries this request's own
+ * cache-creation usage, so Anthropic has processed the prompt and written its
+ * cache entry before a single content block exists.
+ */
+const MESSAGE_START_FRAME = {
+	type: "message_start",
+	message: {
+		id: "msg_cache_break",
+		usage: { input_tokens: 4, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 4 },
+	},
+};
+
+function sseBody(events: ReadonlyArray<{ type: string; [key: string]: unknown }>): string {
+	return `${events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}`).join("\n\n")}\n\n`;
+}
+
+function sseResponse(body: string | ReadableStream<Uint8Array>): Response {
 	return new Response(body, {
 		status: 200,
 		headers: { "Content-Type": "text/event-stream", "request-id": "req_cache_break" },
 	});
-};
+}
+
+const successFetch: FetchImpl = async () =>
+	sseResponse(
+		sseBody([
+			MESSAGE_START_FRAME,
+			{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+			{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+			{ type: "content_block_stop", index: 0 },
+			{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+			{ type: "message_stop" },
+		]),
+	);
 
 /** {@link successFetch} that also records the request body the SDK serialized. */
 function capturingFetch(sink: { body: string }): FetchImpl {
@@ -278,6 +292,65 @@ const rejectedFetch: FetchImpl = async () =>
 		status: 400,
 		headers: { "Content-Type": "application/json" },
 	});
+
+/**
+ * Accepts the request and then dies with no content at all: `message_start`,
+ * then a terminal `error` frame. The provider only stamps `firstTokenTime` on
+ * the first content block, so this is exactly the window where "nothing came
+ * back yet" and "the prefix is not cached yet" disagree.
+ */
+const acceptedThenStreamErrorFetch: FetchImpl = async () =>
+	sseResponse(
+		sseBody([
+			MESSAGE_START_FRAME,
+			{ type: "error", error: { type: "invalid_request_error", message: "generation abandoned mid-envelope" } },
+		]),
+	);
+
+/**
+ * Accepts the request, streams a text block, and then the body ends with no
+ * terminal envelope, the way a connection dropped mid-generation looks. Text
+ * already streamed, so no arm replays the turn.
+ */
+const acceptedThenTruncatedFetch: FetchImpl = async () =>
+	sseResponse(
+		sseBody([
+			MESSAGE_START_FRAME,
+			{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+			{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+		]),
+	);
+
+/**
+ * Streams `message_start`, then aborts the caller's signal without ever
+ * closing the body — a user cancelling a turn that had already started
+ * streaming. The ordering is structural rather than timed: a stream's `pull`
+ * runs while the read that drains the previous chunk is still settling, so the
+ * abort is armed one frame late on purpose. `message_start` therefore reaches
+ * the provider before the signal trips, and the keepalive behind it is the
+ * frame the abort actually cancels.
+ */
+function abortAfterAcceptanceFetch(abort: AbortController): FetchImpl {
+	return async () => {
+		const chunks = [sseBody([MESSAGE_START_FRAME]), sseBody([{ type: "ping" }])];
+		let pulls = 0;
+		return sseResponse(
+			new ReadableStream<Uint8Array>({
+				pull(controller) {
+					const chunk = chunks[pulls];
+					pulls += 1;
+					if (chunk !== undefined) {
+						controller.enqueue(new TextEncoder().encode(chunk));
+						return;
+					}
+					abort.abort();
+					// Never resolves: the abort, not the body, is what ends this turn.
+					return Promise.withResolvers<void>().promise;
+				},
+			}),
+		);
+	};
+}
 
 /**
  * Rejects the first request of a turn with the compiled-grammar 400 Anthropic
@@ -358,7 +431,7 @@ async function turn(
 	fetch: FetchImpl = successFetch,
 	options: Pick<
 		AnthropicOptions,
-		"onPayload" | "sessionId" | "promptCacheKey" | "serviceTier" | "effort" | "thinkingEnabled"
+		"onPayload" | "sessionId" | "promptCacheKey" | "serviceTier" | "effort" | "thinkingEnabled" | "signal"
 	> = {},
 ): Promise<AssistantMessage> {
 	return await streamAnthropic(model, context, {
@@ -573,6 +646,50 @@ describe("anthropic cache-break attribution", () => {
 
 		expect(rejected.stopReason).toBe("error");
 		expect(retried.cacheBreakReason).toEqual({ kind: "tools" });
+	});
+
+	it("advances the snapshot for a stream that failed after it was accepted", async () => {
+		const states = createProviderSessionState();
+		const grown = contextWithTools([tool("lookup", {}), tool("search", {})]);
+		await turn(states, contextWithTools([tool("lookup", {})]), undefined, NO_TOOL_PLANE_MODEL);
+		const failed = await turn(states, grown, undefined, NO_TOOL_PLANE_MODEL, acceptedThenTruncatedFetch);
+		// Anthropic accepted this prefix and wrote its cache entry before the
+		// stream died, so the change belongs to the failed turn and the next one
+		// changed nothing.
+		const next = await turn(states, grown, undefined, NO_TOOL_PLANE_MODEL);
+
+		expect(failed.stopReason).toBe("error");
+		expect(failed.cacheBreakReason).toEqual({ kind: "tools" });
+		expect(next.cacheBreakReason).toBeUndefined();
+	});
+
+	it("advances the snapshot for a stream accepted with no content at all", async () => {
+		const states = createProviderSessionState();
+		const grown = contextWithTools([tool("lookup", {}), tool("search", {})]);
+		await turn(states, contextWithTools([tool("lookup", {})]), undefined, NO_TOOL_PLANE_MODEL);
+		const failed = await turn(states, grown, undefined, NO_TOOL_PLANE_MODEL, acceptedThenStreamErrorFetch);
+		// No content block ever opened, so the provider's "nothing came back"
+		// signal is still unset here — the prefix is cached all the same.
+		const next = await turn(states, grown, undefined, NO_TOOL_PLANE_MODEL);
+
+		expect(failed.stopReason).toBe("error");
+		expect(next.cacheBreakReason).toBeUndefined();
+	});
+
+	it("advances the snapshot for a turn aborted after it was accepted", async () => {
+		const states = createProviderSessionState();
+		const abort = new AbortController();
+		const grown = contextWithTools([tool("lookup", {}), tool("search", {})]);
+		await turn(states, contextWithTools([tool("lookup", {})]), undefined, NO_TOOL_PLANE_MODEL);
+		const aborted = await turn(states, grown, undefined, NO_TOOL_PLANE_MODEL, abortAfterAcceptanceFetch(abort), {
+			signal: abort.signal,
+		});
+		// A cancelled turn still paid for its prefix; the cache does not roll back
+		// because the user changed their mind.
+		const next = await turn(states, grown, undefined, NO_TOOL_PLANE_MODEL);
+
+		expect(aborted.stopReason).toBe("aborted");
+		expect(next.cacheBreakReason).toBeUndefined();
 	});
 
 	it("reports a system-prompt edit with the signed character delta", async () => {

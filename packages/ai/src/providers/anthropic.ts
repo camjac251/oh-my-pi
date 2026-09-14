@@ -2318,6 +2318,10 @@ const streamAnthropicOnce = (
 		};
 		let rawRequestDump: RawHttpRequestDump | undefined;
 		let activeAbortTracker = createAbortSourceTracker(options?.signal);
+		// Cache-break diagnostics: the commit of the most recently accepted
+		// payload, and the only thing the `finally` stores. Declared out here
+		// because the error, abort and success tails all have to reach it.
+		let acceptedCacheBreakCommit: (() => void) | undefined;
 
 		const onSseEvent = options?.onSseEvent;
 		const rawSseObserver = onSseEvent ? (event: RawSseEvent) => onSseEvent(event, model) : undefined;
@@ -2539,9 +2543,22 @@ const streamAnthropicOnce = (
 			}
 			const preparedContext = await prepareAnthropicManyImageContext(context, model.input.includes("image"));
 			// Diagnostics: the prefix snapshot of the pass that actually gets sent.
-			// Committed only after the stream completes, so a turn that fails before
-			// a response leaves the previous snapshot in place for its retry.
+			// Latched the moment Anthropic accepts the response — `message_start` for
+			// a stream, a 2xx body for the zero-output refresh — because from there
+			// on the request has been processed and its prefix may already be
+			// written, and stored exactly once in the `finally` below. A turn that
+			// fails before any response therefore still leaves the previous snapshot
+			// in place for its retry, while one that dies or is aborted after
+			// acceptance advances it the way the cache did.
+			//
+			// A degradation retry reassigns this to the payload it is about to send
+			// and `acceptedCacheBreakCommit` is only re-latched when that payload is
+			// accepted in turn, so the commit that runs is never one for an attempt
+			// still awaiting its own acceptance — the loop has exited by then — and a
+			// rebuild rejected before any response leaves the latch pointing at the
+			// prefix Anthropic really cached.
 			let commitCacheBreakSnapshot: () => void = () => {};
+
 			// A baseline reset names its cause exactly once: `buildParams` consumes
 			// `pendingCacheBreakReason` on the first pass, so an in-provider
 			// degradation retry that rebuilds the same turn finds nothing there even
@@ -2685,6 +2702,10 @@ const streamAnthropicOnce = (
 				}
 				const response = await request.asResponse();
 				await notifyProviderResponse(options, response, model, response.headers.get("request-id"));
+				// A resolved `asResponse()` is this path's acceptance: the SDK rejects
+				// non-2xx, so the prefix is written even when the body below turns out
+				// to be unparseable.
+				acceptedCacheBreakCommit = commitCacheBreakSnapshot;
 				const body: unknown = await response.json();
 				if (!isRecord(body)) {
 					throw new AIError.AnthropicStreamEnvelopeError("Anthropic cache refresh returned a malformed response");
@@ -2710,7 +2731,6 @@ const streamAnthropicOnce = (
 					output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
 				calculateCost(model, output.usage, output.timestamp);
 				output.duration = performance.now() - startTime;
-				commitCacheBreakSnapshot();
 				stream.push({ type: "start", partial: output });
 				stream.push({ type: "done", reason: "stop", message: output });
 				stream.end();
@@ -2960,6 +2980,9 @@ const streamAnthropicOnce = (
 								continue;
 							}
 							sawMessageStart = true;
+							// Acceptance: this envelope carries the request's own cache
+							// usage, so the prefix is written whatever the stream does next.
+							acceptedCacheBreakCommit = commitCacheBreakSnapshot;
 							const startMessage = event.message;
 							if (startMessage?.id) output.responseId = startMessage.id;
 							applyReportedInputTransformations(
@@ -3585,7 +3608,6 @@ const streamAnthropicOnce = (
 				}
 			}
 			output.duration = performance.now() - startTime;
-			commitCacheBreakSnapshot();
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			if (dropFastMode && model.provider === "anthropic" && options?.serviceTier === "priority") {
 				output.disabledFeatures = [...(output.disabledFeatures ?? []), "priority"];
@@ -3613,6 +3635,11 @@ const streamAnthropicOnce = (
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
+		} finally {
+			// One commit per turn on every exit path — the success tail, the error
+			// and abort tail, and the zero-output refresh's own `return` all land
+			// here — with the latch as the sole decision of whether to store.
+			acceptedCacheBreakCommit?.();
 		}
 	})();
 
@@ -4767,9 +4794,10 @@ function getAnthropicPayloadCacheControl(params: MessageCreateParamsStreaming): 
 /**
  * Outcome of one cache-break detection pass. `reason` is reported at once;
  * `commit` stores this request's prefix snapshot as the conversation's last
- * sent shape and is deferred until the request is accepted, so a request that
- * never reached Anthropic leaves the previous snapshot intact and an outer
- * retry of the same turn can still name what it changed.
+ * sent shape and is deferred until Anthropic accepts the response — not until
+ * the stream ends cleanly, because acceptance is when the prefix is written —
+ * so a request that never reached Anthropic leaves the previous snapshot
+ * intact and an outer retry of the same turn can still name what it changed.
  */
 type AnthropicCacheBreakDetection = {
 	reason: CacheBreakReason | undefined;
@@ -5242,7 +5270,8 @@ function buildParams(
 		model.compat.escapeBuiltinToolNames,
 	);
 	// Consume baseline reset diagnostics now; the caller compares the final
-	// payload after its hook and commits the snapshot only on success.
+	// payload after its hook and commits the snapshot once the response is
+	// accepted.
 	const controlReason = controlState?.pendingCacheBreakReason;
 	if (controlState) controlState.pendingCacheBreakReason = undefined;
 	// Anchor the stable tools+system head so it stays cached across turns; the
