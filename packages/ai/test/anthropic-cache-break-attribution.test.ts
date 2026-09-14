@@ -243,6 +243,46 @@ function rewriteWireEffort(effort: string): NonNullable<AnthropicOptions["onPayl
 }
 
 /**
+ * Shape of a wire message as the thinking hooks below read it: enough to find
+ * the replayed `thinking` / `redacted_thinking` blocks on a prior assistant
+ * turn and rewrite them in place of the block the provider materialized.
+ */
+type WireThinkingBlock = { type: string; thinking?: string; signature?: string; data?: string };
+type WireThinkingMessage = { role: string; content: string | WireThinkingBlock[] };
+
+function mapWireBlocks(
+	payload: unknown,
+	map: (block: WireThinkingBlock) => WireThinkingBlock,
+): Record<string, unknown> {
+	const assembled = payload as Record<string, unknown> & { messages: readonly WireThinkingMessage[] };
+	return {
+		...assembled,
+		messages: assembled.messages.map(message =>
+			typeof message.content === "string" ? message : { ...message, content: message.content.map(map) },
+		),
+	};
+}
+
+/**
+ * Payload hook that returns a replacement body whose replayed `thinking` block
+ * carries different reasoning under the signature the provider replayed. Every
+ * other byte — the message's own text block, its position, the tool array, the
+ * system blocks, retention — is the one `buildParams` assembled, so a branch
+ * or a hook substituting one assistant's reasoning for another's is the only
+ * difference between the assembled payload and the sent one.
+ */
+const rewriteWireThinking: NonNullable<AnthropicOptions["onPayload"]> = payload =>
+	mapWireBlocks(payload, block =>
+		block.type === "thinking" ? { ...block, thinking: "Rewritten after assembly." } : block,
+	);
+
+/** {@link rewriteWireThinking} for the opaque `redacted_thinking` payload. */
+const rewriteWireRedactedThinking: NonNullable<AnthropicOptions["onPayload"]> = payload =>
+	mapWireBlocks(payload, block =>
+		block.type === "redacted_thinking" ? { ...block, data: "rewritten-redacted-payload" } : block,
+	);
+
+/**
  * `message_start` is the acceptance boundary: it carries this request's own
  * cache-creation usage, so Anthropic has processed the prompt and written its
  * cache entry before a single content block exists.
@@ -396,6 +436,66 @@ function fastModeRejectedOnceFetch(sink: { bodies: string[] }): FetchImpl {
 		return await successFetch(input, init);
 	};
 }
+
+/**
+ * Rejects the first request of a turn with the 400 Anthropic returns when a
+ * replayed signed thinking block is bound to a conversation prefix the request
+ * no longer carries, then succeeds. The provider answers by remembering the
+ * bound blocks on its session state and rebuilding the turn without them, so
+ * this is the provider's own between-turn decision to stop replaying thinking
+ * — no hook, no caller change.
+ */
+function thinkingPrefixRejectedOnceFetch(sink: { bodies: string[] }): FetchImpl {
+	return async (input, init) => {
+		sink.bodies.push(typeof init?.body === "string" ? init.body : "");
+		if (sink.bodies.length === 1) {
+			return new Response(
+				JSON.stringify({
+					type: "error",
+					error: {
+						type: "invalid_request_error",
+						message:
+							"messages.1.content.0: invalid `signature` in `thinking` block: the block is bound to a different conversation",
+					},
+				}),
+				{ status: 400, headers: { "Content-Type": "application/json" } },
+			);
+		}
+		return await successFetch(input, init);
+	};
+}
+
+/** Reasoning the provider replays natively, because it is signed and same-deployment. */
+const SIGNED_THINKING: AssistantMessage["content"] = [
+	{ type: "thinking", thinking: "Read the file, then summarise.", thinkingSignature: "sig-prior-turn" },
+	{ type: "text", text: "on it" },
+];
+
+/** The same turn with an opaque redacted payload in place of the signed one. */
+const REDACTED_THINKING: AssistantMessage["content"] = [
+	{ type: "redactedThinking", data: "redacted-prior-turn-payload" },
+	{ type: "text", text: "on it" },
+];
+
+/**
+ * A conversation whose middle message is an assistant turn carrying replayed
+ * reasoning. The trailing message is a real user turn, so there is no
+ * `Continue.` pad and every message is part of the compared prefix.
+ */
+function contextWithPriorThinking(content: AssistantMessage["content"]): Context {
+	return {
+		systemPrompt: ["You are a precise assistant."],
+		messages: [
+			{ role: "user", content: "Think it through", timestamp: 1 },
+			assistantTurn(content, 2),
+			{ role: "user", content: "keep going", timestamp: 3 },
+		],
+		tools: [tool("lookup", {})],
+	};
+}
+
+/** Thinking must be on for the provider to replay a prior turn's reasoning. */
+const THINKING: Pick<AnthropicOptions, "thinkingEnabled"> = { thinkingEnabled: true };
 
 /** Fast mode is what the in-provider degradation retry below strips. */
 const PRIORITY: Pick<AnthropicOptions, "serviceTier"> = { serviceTier: "priority" };
@@ -1348,5 +1448,81 @@ describe("anthropic cache-break attribution", () => {
 		expect(sent.body).toContain('{"role":"system","content":[],"output_config":{"effort":"max"}}');
 		expect(second.cacheBreakReason).toBeUndefined();
 		expect(third.cacheBreakReason).toEqual({ kind: "history_rewrite" });
+	});
+
+	it("reports a hook-rewritten thinking block on a prior assistant turn", async () => {
+		const states = createProviderSessionState();
+		const declared = { body: "" };
+		const sent = { body: "" };
+		const context = contextWithPriorThinking(SIGNED_THINKING);
+		await turn(states, context, undefined, MODEL, successFetch, THINKING);
+		// Replaying the same signed block changes nothing, which is what makes
+		// the third turn's rewrite the only difference there is.
+		const second = await turn(states, context, undefined, MODEL, capturingFetch(declared), THINKING);
+		// The hook swaps the reasoning under the replayed signature and leaves
+		// the turn's text block alone. The history chain projects thinking out
+		// of an assistant message, so nothing else in the request compares
+		// these bytes and the turn would go cold with nothing to report.
+		const third = await turn(states, context, undefined, MODEL, capturingFetch(sent), {
+			...THINKING,
+			onPayload: rewriteWireThinking,
+		});
+
+		// Without the block really being replayed and then really rewritten on
+		// the wire, there is no prefix change to attribute.
+		expect(declared.body).toContain('{"type":"thinking","thinking":"Read the file, then summarise."');
+		expect(sent.body).toContain('{"type":"thinking","thinking":"Rewritten after assembly."');
+		// The visible content the chain does measure is untouched on both.
+		expect(sent.body).toContain('{"type":"text","text":"on it"');
+		expect(second.cacheBreakReason).toBeUndefined();
+		expect(third.cacheBreakReason).toEqual({ kind: "history_rewrite" });
+	});
+
+	it("reports a hook-rewritten redacted_thinking block on a prior assistant turn", async () => {
+		const states = createProviderSessionState();
+		const declared = { body: "" };
+		const sent = { body: "" };
+		const context = contextWithPriorThinking(REDACTED_THINKING);
+		await turn(states, context, undefined, MODEL, successFetch, THINKING);
+		const second = await turn(states, context, undefined, MODEL, capturingFetch(declared), THINKING);
+		const third = await turn(states, context, undefined, MODEL, capturingFetch(sent), {
+			...THINKING,
+			onPayload: rewriteWireRedactedThinking,
+		});
+
+		expect(declared.body).toContain('{"type":"redacted_thinking","data":"redacted-prior-turn-payload"}');
+		expect(sent.body).toContain('{"type":"redacted_thinking","data":"rewritten-redacted-payload"}');
+		expect(sent.body).toContain('{"type":"text","text":"on it"');
+		expect(second.cacheBreakReason).toBeUndefined();
+		expect(third.cacheBreakReason).toEqual({ kind: "history_rewrite" });
+	});
+
+	it("reports the turn on which the provider itself stopped replaying a prior thinking block", async () => {
+		const states = createProviderSessionState();
+		const sink = { bodies: [] as string[] };
+		const after = { body: "" };
+		const context = contextWithPriorThinking(SIGNED_THINKING);
+		await turn(states, context, undefined, MODEL, successFetch, THINKING);
+		// Anthropic rejects the replayed block as bound to a prefix this
+		// request no longer carries. The provider remembers it on the session
+		// state and rebuilds the turn without it: an unhooked, provider-driven
+		// change to bytes the cached prefix already held, with every other
+		// dimension — chain, control declarations, system, tools, retention —
+		// equal. Reported, because nothing else names it and the turn is cold.
+		const second = await turn(states, context, undefined, MODEL, thinkingPrefixRejectedOnceFetch(sink), THINKING);
+		// The drop is latched on the session state, so the next turn sends the
+		// same history the accepted attempt did and has nothing to report. The
+		// decision answers once, on the turn the behavior changed.
+		const third = await turn(states, context, undefined, MODEL, capturingFetch(after), THINKING);
+
+		// Without the first attempt really carrying the block and the accepted
+		// one really dropping it, there is no provider-driven change to report.
+		expect(sink.bodies).toHaveLength(2);
+		expect(sink.bodies[0]).toContain('"type":"thinking"');
+		expect(sink.bodies[1]).not.toContain('"type":"thinking"');
+		expect(sink.bodies[1]).toContain('{"type":"text","text":"on it"');
+		expect(after.body).not.toContain('"type":"thinking"');
+		expect(second.cacheBreakReason).toEqual({ kind: "history_rewrite" });
+		expect(third.cacheBreakReason).toBeUndefined();
 	});
 });

@@ -470,6 +470,15 @@ type AnthropicCachePrefixSnapshot = {
 	 */
 	historyChain: bigint;
 	/**
+	 * Second chain over the same messages, folded from the thinking blocks
+	 * {@link historyChain} projects out of an assistant turn ({@link
+	 * anthropicThinkingBlocksImage}) and read at the same {@link messageCount}
+	 * mark. Those bytes sit inside the cached prefix and nothing else in the
+	 * request compares them, so a replaced thinking block is observable here
+	 * and nowhere else.
+	 */
+	thinkingChain: bigint;
+	/**
 	 * Fingerprint of the control declarations the sent history carried ({@link
 	 * anthropicControlDeclarationsFingerprint}). {@link historyChain} projects
 	 * those bytes out, so this is the only thing that compares them.
@@ -4262,6 +4271,14 @@ function resetAnthropicControlState(state: AnthropicControlState, cacheBreakReas
  * And string content, which {@link applyCacheControlToMessage} promotes to a
  * single text block when a breakpoint lands on it, so the two spellings of one
  * message must hash alike.
+ *
+ * The thinking blocks this removes are the ones {@link
+ * anthropicControlAnchor} and {@link anthropicConversationIdentity} must not
+ * see: an anchor that moved because a block was signed or demoted would
+ * withdraw the whole control baseline. They are still bytes of the cached
+ * prefix, so {@link anthropicHistoryChain} folds them into a second chain of
+ * their own ({@link anthropicThinkingBlocksImage}) rather than leaving them
+ * observed by nothing.
  */
 function anthropicControlMessageProjection(message: MessageParam): MessageParam {
 	const { content } = message;
@@ -4404,6 +4421,42 @@ function anthropicControlDeclarationsFingerprint(messages: readonly MessageParam
 	return String(Bun.hash(JSON.stringify(toWellFormedDeep(anthropicControlDeclarations(messages)))));
 }
 
+/**
+ * Hash image of the thinking an assistant message carries, or `undefined` when
+ * it carries none. Exactly the bytes {@link
+ * anthropicControlMessageProjection} takes out of an assistant turn, and
+ * nothing else — the two are the halves of one split, and this side exists so
+ * those bytes are still compared somewhere.
+ *
+ * `position` is the message's index in the chain's own population, not its
+ * wire index, and it is folded in so that moving a block between two messages
+ * whose visible content is identical cannot hash alike. Wire index would be
+ * wrong: a control-only system message is not in the chain at all, so
+ * splicing or withdrawing one shifts every later wire index while the cached
+ * prefix of the messages themselves is untouched, and every plane-carried
+ * transition would read as a thinking change.
+ *
+ * `at` is the block's own offset inside the message, because a thinking block
+ * that changes places with a text block moves the prefix from the earlier of
+ * the two on, and the projected chain cannot see that — it holds only the text.
+ *
+ * No `cache_control` scrub, unlike the projection: {@link
+ * applyCacheControlToLastBlock} refuses to mark a thinking block, so omp's own
+ * rolling breakpoints never land on one, and a hook that adds one really is a
+ * byte a cached prefix did not hold.
+ */
+function anthropicThinkingBlocksImage(message: MessageParam, position: number): string | undefined {
+	if (message.role !== "assistant") return undefined;
+	const { content } = message;
+	if (typeof content === "string") return undefined;
+	const blocks: Array<{ at: number; block: ContentBlockParam }> = [];
+	for (let at = 0; at < content.length; at++) {
+		const block = content[at];
+		if (block.type === "thinking" || block.type === "redacted_thinking") blocks.push({ at, block });
+	}
+	return blocks.length === 0 ? undefined : JSON.stringify({ position, blocks });
+}
+
 /** One request's view of the wire history, from a single pass over it. */
 type AnthropicHistoryChain = {
 	/**
@@ -4416,6 +4469,14 @@ type AnthropicHistoryChain = {
 	chain: bigint;
 	/** Chain after the first `markAt`; absent when this history is shorter than that. */
 	mark: bigint | undefined;
+	/**
+	 * Parallel chain over the thinking blocks the projection removed ({@link
+	 * anthropicThinkingBlocksImage}), folded over the same population in the
+	 * same order so it is comparable the same way.
+	 */
+	thinkingChain: bigint;
+	/** {@link thinkingChain} at the first `markAt`; absent on the same condition as `mark`. */
+	thinkingMark: bigint | undefined;
 };
 
 /**
@@ -4443,20 +4504,37 @@ type AnthropicHistoryChain = {
  * to report. Control declarations are projected out — see {@link
  * anthropicHistoryMessageProjection} — precisely because they are the opposite
  * case: they never go unexplained.
+ *
+ * The thinking blocks the projection removed are folded into a second chain
+ * over the same population, marked at the same point, because they are the
+ * `clear_at` case rather than the control-declaration case: dropping a
+ * thinking block out of a mid-history assistant turn moves every byte after
+ * it, and no other dimension names it. It has to be a chain and not a
+ * whole-history fingerprint for the reason above — every reasoning turn
+ * appends thinking, so a whole-history comparison would report on every
+ * single turn.
  */
 function anthropicHistoryChain(messages: readonly MessageParam[], markAt: number): AnthropicHistoryChain {
 	const stableCount = anthropicStableMessageCount(messages);
 	let chain = 0n;
+	let thinkingChain = 0n;
 	let messageCount = 0;
 	let mark = markAt === 0 ? chain : undefined;
+	let thinkingMark = markAt === 0 ? thinkingChain : undefined;
 	for (let index = 0; index < stableCount; index++) {
-		const projected = anthropicHistoryMessageProjection(messages[index]);
+		const message = messages[index];
+		const projected = anthropicHistoryMessageProjection(message);
 		if (projected === undefined) continue;
 		chain = Bun.hash.wyhash(JSON.stringify(projected), chain);
 		messageCount++;
-		if (messageCount === markAt) mark = chain;
+		const thinking = anthropicThinkingBlocksImage(message, messageCount);
+		if (thinking !== undefined) thinkingChain = Bun.hash.wyhash(thinking, thinkingChain);
+		if (messageCount === markAt) {
+			mark = chain;
+			thinkingMark = thinkingChain;
+		}
 	}
-	return { messageCount, chain, mark };
+	return { messageCount, chain, mark, thinkingChain, thinkingMark };
 }
 
 /**
@@ -4816,9 +4894,10 @@ const NO_CACHE_BREAK_DETECTION: AnthropicCacheBreakDetection = { reason: undefin
  *
  * Resolution order when several apply: `history_rewrite` (the whole tail moved,
  * so everything after it is cold anyway) — from the chain, then from the
- * control declarations the chain cannot see — then `system_prompt` (earliest
- * block in the prefix), then `tools`, then `retention` (the prefix text is
- * unchanged but its cache entry is not reusable).
+ * control declarations the chain cannot see, then from the thinking blocks it
+ * cannot see either — then `system_prompt` (earliest block in the prefix),
+ * then `tools`, then `retention` (the prefix text is unchanged but its cache
+ * entry is not reusable).
  *
  * `history_rewrite` covers any wire history the previous one is not a prefix
  * of: a replaced root, an edited or removed middle message, a rewind, a branch
@@ -4874,6 +4953,40 @@ const NO_CACHE_BREAK_DETECTION: AnthropicCacheBreakDetection = { reason: undefin
  * open, and closing it would cost the exemption: the payload cannot say which
  * declarations the plane authored, and a comparison that ignores provenance
  * blames every ordinary add and removal.
+ *
+ * Thinking blocks are outside the chain for the same reason and get the second
+ * chain {@link anthropicHistoryChain} folds beside it, read at the same mark
+ * and reported as the same `history_rewrite`. What they deliberately do NOT
+ * get is the planned-versus-sent exemption the declarations above have. That
+ * discriminator is sound for declarations because every change the provider
+ * itself makes to them is either prefix-neutral by construction — a
+ * `tool_addition` / `tool_removal` exists precisely so an add or a remove does
+ * not rewrite the prefix — or carried by a reset that records its own cause on
+ * another dimension. Neither holds for thinking: `dropAllThinking` and the
+ * `droppedThinkingBlocks` set delete blocks out of assistant turns the cached
+ * prefix already holds, name nothing, and leave every other dimension equal.
+ * Exempting them because they were planned would silence a turn that really
+ * did go cold with no cause to report, which is the one failure this detection
+ * exists to remove. So the comparison is unconditional, and a provider
+ * decision that changes the replayed thinking between turns is reported like
+ * any other rewrite of those bytes.
+ *
+ * That is also the only reading that stays consistent with what the provider's
+ * other thinking decision already reports. Demoting unsigned thinking
+ * (`replayUnsignedThinking`, and the runtime auto-mark behind it) replaces the
+ * block with a `text` block, which the chain measures, so that turn has always
+ * answered `history_rewrite`. Silencing the drop while the demote reports
+ * would make attribution depend on which shape the provider happened to pick
+ * for the same kind of decision. Both learn flags latch on the session state,
+ * so a session answers once, on the turn the behavior changed, and is silent
+ * afterwards.
+ *
+ * A single unconditional comparison also covers the payload hook without a
+ * planned capture: it compares one sent history against the previously sent
+ * one, so a hook that replaces a prior assistant's `thinking` or
+ * `redacted_thinking` on one turn is reported, and a hook that rewrites the
+ * same way on every turn stands still and stays silent — the same
+ * both-directions behavior as the tool array.
  *
  * The cause a reset recorded is latched across an in-provider degradation
  * rebuild — `buildParams` consumes it once, and the tool it names is
@@ -4977,6 +5090,7 @@ function detectAnthropicCacheBreak(
 	const snapshot: AnthropicCachePrefixSnapshot = {
 		messageCount: history.messageCount,
 		historyChain: history.chain,
+		thinkingChain: history.thinkingChain,
 		controlFingerprint,
 		controlPlanned,
 		systemFingerprint,
@@ -5016,6 +5130,12 @@ function detectAnthropicCacheBreak(
 	if (!(controlPlanned && previous.controlPlanned) && previous.controlFingerprint !== controlFingerprint) {
 		return { reason: { kind: "history_rewrite" }, commit };
 	}
+	// The thinking the chain projected out, compared the same way the chain
+	// itself is: this request's fold over its own first `previous.messageCount`
+	// messages against the value the previous one stored. Unconditional — see
+	// above: the provider's own removals of these bytes are neither
+	// prefix-neutral nor named anywhere else, so there is nothing to exempt.
+	if (history.thinkingMark !== previous.thinkingChain) return { reason: { kind: "history_rewrite" }, commit };
 	if (previous.systemFingerprint !== systemFingerprint) {
 		return {
 			reason: { kind: "system_prompt", charDelta: systemTextLength - previous.systemTextLength },
