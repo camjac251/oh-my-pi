@@ -13,6 +13,9 @@
 ### Fixed
 
 - `/debug` memory reports now include numeric memory statistics instead of raw heap snapshots that could expose provider and MCP credentials.
+### Changed
+
+- The cache miss marker now names what broke the prefix on Anthropic turns, for example `cache miss · 52K tokens · system prompt changed (+40 chars)`. Enable it with `display.cacheMissMarker` ([#11813](https://github.com/can1357/oh-my-pi/pull/11813) by [@camjac251](https://github.com/camjac251)).
 
 ## [18.1.21] - 2026-09-14
 
@@ -25,10 +28,6 @@
 - First-use Chromium installation and browser operations no longer consume Eval's runtime timeout or reset its kernel while waiting.
 - Browser startup reuses a successful system-Chrome fallback instead of retrying an unavailable download during the same open.
 - Browser clicks and other interactions no longer stall when OMP-owned tabs are in the background, including after worker timeout recovery.
-
-### Changed
-
-- The cache miss marker now names what broke the prefix on Anthropic turns, for example `cache miss · 52K tokens · system prompt changed (+40 chars)`. Enable it with `display.cacheMissMarker` ([#11813](https://github.com/can1357/oh-my-pi/pull/11813) by [@camjac251](https://github.com/camjac251)).
 
 ## [18.1.20] - 2026-09-13
 
