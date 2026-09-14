@@ -137,6 +137,23 @@ function assistantTurn(content: AssistantMessage["content"], timestamp: number):
 }
 
 /**
+ * A conversation of `exchanges` completed assistant/user pairs after the
+ * opening user turn, with every earlier message byte-identical across calls
+ * and a real user turn last, so no `Continue.` pad is on the wire. An append
+ * is therefore the only difference between `appendingHistory(n)` and
+ * `appendingHistory(n + 1)`, which is what makes the prefix a turn inherited
+ * — and a bound on it — observable at all.
+ */
+function appendingHistory(exchanges: number, tools: Tool[]): Context {
+	const messages: Message[] = [{ role: "user", content: "Use the tools", timestamp: 1 }];
+	for (let index = 0; index < exchanges; index++) {
+		messages.push(assistantTurn([{ type: "text", text: `reply ${index}` }], index * 2 + 2));
+		messages.push({ role: "user", content: `follow-up ${index}`, timestamp: index * 2 + 3 });
+	}
+	return { ...contextWithTools(tools), messages };
+}
+
+/**
  * Payload hook that returns a replacement body whose `messages[0]` is a
  * different message and whose system blocks, tool array, retention and later
  * messages are the ones `buildParams` assembled. A rewritten conversation root
@@ -1448,6 +1465,56 @@ describe("anthropic cache-break attribution", () => {
 		expect(sent.body).toContain('{"role":"system","content":[],"output_config":{"effort":"max"}}');
 		expect(second.cacheBreakReason).toBeUndefined();
 		expect(third.cacheBreakReason).toEqual({ kind: "history_rewrite" });
+	});
+
+	it("does not report a declaration a hook rewrote only in the messages this turn appended", async () => {
+		const states = createProviderSessionState();
+		const sent = { body: "" };
+		const declared = [tool("lookup", {}), tool("compute", {})];
+		await turn(states, appendingHistory(0, declared));
+		// `search` joins on a turn that also appends an exchange, so the plane
+		// anchors its `tool_addition` at the end of the wire history — after
+		// every message the first turn sent. The hook then rewrites that block.
+		// Those bytes sit past the prefix the first turn cached and cannot have
+		// invalidated it, so a cold turn here is an expiry with no cause to
+		// name, and reporting one would mislabel it.
+		const second = await turn(
+			states,
+			appendingHistory(1, [...declared, tool("search", {})]),
+			undefined,
+			MODEL,
+			capturingFetch(sent),
+			{ onPayload: rewriteWireToolAddition },
+		);
+
+		// Without the declaration really being rewritten, and really sitting
+		// after the appended user turn, there is nothing for the bound to keep
+		// quiet about.
+		expect(sent.body).toContain('{"type":"tool_addition","tool":{"type":"tool_reference","name":"rewritten"}}');
+		expect(sent.body.indexOf('"rewritten"')).toBeGreaterThan(sent.body.indexOf("follow-up 0"));
+		expect(second.cacheBreakReason).toBeUndefined();
+	});
+
+	it("reports a hook-rewritten declaration inside the cached prefix on a turn that also appended", async () => {
+		const states = createProviderSessionState();
+		const sent = { body: "" };
+		const declared = [tool("lookup", {}), tool("compute", {})];
+		const grown = [...declared, tool("search", {})];
+		await turn(states, appendingHistory(0, declared));
+		// `search` declares itself at the end of this turn's history.
+		await turn(states, appendingHistory(1, grown));
+		// Two more exchanges leave that declaration strictly inside the prefix
+		// the previous turn cached, with chained messages on both sides of it.
+		await turn(states, appendingHistory(2, grown));
+		const fourth = await turn(states, appendingHistory(3, grown), undefined, MODEL, capturingFetch(sent), {
+			onPayload: rewriteWireToolAddition,
+		});
+
+		// Without the declaration really sitting before a message the previous
+		// turn also sent, this would pass on the append case above instead.
+		expect(sent.body).toContain('{"type":"tool_addition","tool":{"type":"tool_reference","name":"rewritten"}}');
+		expect(sent.body.indexOf('"rewritten"')).toBeLessThan(sent.body.indexOf("follow-up 1"));
+		expect(fourth.cacheBreakReason).toEqual({ kind: "history_rewrite" });
 	});
 
 	it("reports a hook-rewritten thinking block on a prior assistant turn", async () => {
