@@ -51,6 +51,16 @@ type SessionDisposeReason = "evict" | "shutdown";
 export interface AuthGatewaySessionStateLease {
 	/** The map to hand to `streamSimple` as `providerSessionState`. */
 	readonly states: Map<string, ProviderSessionState>;
+	/**
+	 * Re-point this entry at `account`, resetting the account-scoped records
+	 * when it differs from the identity the entry currently reflects.
+	 *
+	 * Called when the in-request auth retry rotates to a sibling credential, so
+	 * the rotated attempt does not run on the previous account's learning. Safe
+	 * only between attempts — see {@link AuthGatewaySessionStateRequest.account}.
+	 * A no-op once the lease is released.
+	 */
+	retarget(account: string): void;
 	/** Give up this request's claim. Idempotent. */
 	release(): void;
 }
@@ -73,10 +83,14 @@ export interface AuthGatewaySessionStateRequest {
 	/**
 	 * Stable identity of the account this request's credential resolved to.
 	 * A change means the gateway switched the session to a sibling credential,
-	 * so the account-dependent lessons in the retained map are re-probed. The
-	 * comparison happens here, at a request boundary, rather than inside the
-	 * retry that rotated: a provider mid-attempt is reading the very records
-	 * that would be reset under it.
+	 * so the account-dependent lessons in the retained map are re-probed.
+	 *
+	 * The comparison runs at two points, both of them between attempts: here,
+	 * when the request is placed on the entry, and again at
+	 * {@link AuthGatewaySessionStateLease.retarget} when the in-request auth
+	 * retry rotates to a sibling. It MUST NOT run at an arbitrary mid-attempt
+	 * moment: a provider in the middle of an attempt is reading the very
+	 * records a reset would clear.
 	 */
 	account: string;
 }
@@ -221,7 +235,10 @@ export class AuthGatewaySessionStateStore {
 	 * — most of what is retained is true of the endpoint whoever calls it, and
 	 * Codex already sub-keys its transport by account and bearer — so a
 	 * credential switch resets the account-dependent subset instead of
-	 * splitting the entry (see `resetAccountScopedProviderSessionState`).
+	 * splitting the entry (see `resetAccountScopedProviderSessionState`), here
+	 * for a switch that happened between requests and at
+	 * {@link AuthGatewaySessionStateLease.retarget} for one the request's own
+	 * auth retry performed.
 	 *
 	 * The returned lease MUST be released; until then the entry cannot be
 	 * evicted.
@@ -231,6 +248,10 @@ export class AuthGatewaySessionStateStore {
 		let released = false;
 		return {
 			states: session.states,
+			retarget: (account: string): void => {
+				if (released) return;
+				this.#retarget(session, account);
+			},
 			release: (): void => {
 				if (released) return;
 				released = true;
@@ -270,16 +291,35 @@ export class AuthGatewaySessionStateStore {
 			session.key = key;
 			this.#sessions.set(key, session);
 			session.leases++;
-			if (session.account !== account) {
-				resetAccountScopedProviderSessionState(session.states);
-				session.account = account;
-			}
+			this.#retarget(session, account);
 			return session;
 		}
 		const created: RetainedSession = { key, states: new Map(), account, leases: 1 };
 		this.#sessions.set(key, created);
 		this.#evict();
 		return created;
+	}
+
+	/**
+	 * Point an entry at `account`, re-probing the account-dependent lessons when
+	 * that is not the account the entry's records were learned under.
+	 *
+	 * The identity, not the bearer, is what gates the reset: a token refresh and
+	 * a rotation onto a second row of the same account both hand us a new key
+	 * for an account whose entitlements are unchanged, and resetting there would
+	 * discard the retained lessons for nothing.
+	 *
+	 * Both callers are between attempts of *their own* request. A second request
+	 * already holding this entry — two concurrent turns of one conversation —
+	 * can be mid-attempt, and that is the bound of what this reset is allowed to
+	 * touch: fields a provider re-reads at the top of each attempt, never a
+	 * socket or a `close()`. The worst outcome is that the concurrent turn
+	 * re-probes one lesson, which is the cost of the reset itself.
+	 */
+	#retarget(session: RetainedSession, account: string): void {
+		if (session.account === account) return;
+		resetAccountScopedProviderSessionState(session.states);
+		session.account = account;
 	}
 
 	/**

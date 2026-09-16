@@ -9,14 +9,15 @@
  * server-side owner, every containerized / robomp turn re-pays the rejected
  * upstream round-trip that already taught the lesson.
  */
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { AuthGatewaySessionStateStore, startAuthGateway } from "@oh-my-pi/pi-ai/auth-gateway";
 import type { AuthGatewayServerHandle, AuthGatewaySessionStateRequest } from "@oh-my-pi/pi-ai/auth-gateway";
-import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
+import { AuthStorage, type OAuthCredential } from "@oh-my-pi/pi-ai/auth-storage";
+import * as oauthUtils from "@oh-my-pi/pi-ai/registry/oauth";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import type { Api, Context, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -77,8 +78,33 @@ const FAST_MODE_REJECTION = {
 	},
 };
 
+/**
+ * What the real API answers when the compiled tool grammar is too large. Must
+ * stay classifiable as `Grammar`: HTTP 400 + `invalid_request_error` +
+ * "compiled grammar" + "too large".
+ */
+const GRAMMAR_REJECTION = {
+	type: "error",
+	error: {
+		type: "invalid_request_error",
+		message:
+			"The compiled grammar is too large, which would cause performance issues. Simplify your tool schemas or reduce the number of strict tools.",
+	},
+};
+
+/**
+ * What the real API answers once an account's own quota window is spent. Must
+ * stay classifiable as a usage limit so the gateway blocks that credential and
+ * rotates to a sibling instead of surfacing the failure.
+ */
+const USAGE_LIMIT_REJECTION = {
+	type: "error",
+	error: { type: "rate_limit_error", message: "usage_limit_reached" },
+};
+
 interface UpstreamPayload {
 	speed?: string;
+	tools?: Array<{ strict?: boolean }>;
 }
 
 interface Upstream {
@@ -86,29 +112,51 @@ interface Upstream {
 	url: string;
 	/** One entry per upstream Anthropic request, in order. */
 	payloads: UpstreamPayload[];
+	/** The bearer each of those requests arrived with, same order. */
+	bearers: Array<string | undefined>;
+	/** Bearers whose account holds the fast-mode entitlement. */
+	entitled: Set<string>;
+	/** Bearers whose account has spent its quota window. */
+	exhausted: Set<string>;
 	stop(): void;
 }
 
 /**
- * Stand-in Anthropic endpoint. Rejects every request carrying `speed` — what
- * the live API does for an account or model without the fast-mode entitlement
- * — so the provider's one-shot fallback fires, and a gateway that retained the
- * lesson never asks again.
+ * Stand-in Anthropic endpoint, answering per credential.
+ *
+ * Rejects `speed` unless the request's bearer is in `entitled` — what the live
+ * API does for an account without the fast-mode entitlement, so the provider's
+ * one-shot fallback fires and a gateway that retained the lesson never asks
+ * again. Rejects strict tool schemas with the grammar-too-large 400 whatever
+ * the bearer: the compiled grammar is a property of the deployment, not the
+ * account. Answers a bearer in `exhausted` with a usage-limit block, which is
+ * what makes the gateway rotate mid-request.
  */
 function startUpstream(): Upstream {
 	const payloads: UpstreamPayload[] = [];
+	const bearers: Array<string | undefined> = [];
+	const entitled = new Set<string>();
+	const exhausted = new Set<string>();
 	const sse = `${SSE_EVENTS.map(event => `event: ${String(event.type)}\ndata: ${JSON.stringify(event)}`).join("\n\n")}\n\n`;
+	const reject = (body: unknown, status: number): Response =>
+		new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 	const server = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
 		fetch: async (req): Promise<Response> => {
+			// The usage-limit path also probes `/api/oauth/usage`; only inference
+			// requests are the trace this fixture records.
+			if (new URL(req.url).pathname !== "/v1/messages") return new Response("{}", { status: 404 });
 			const payload = (await req.json()) as UpstreamPayload;
+			// API-key credentials arrive as `x-api-key`, OAuth ones as a bearer.
+			const bearer =
+				req.headers.get("x-api-key") ?? req.headers.get("authorization")?.replace(/^Bearer /i, "") ?? undefined;
 			payloads.push(payload);
-			if (payload.speed !== undefined) {
-				return new Response(JSON.stringify(FAST_MODE_REJECTION), {
-					status: 400,
-					headers: { "Content-Type": "application/json" },
-				});
+			bearers.push(bearer);
+			if (bearer !== undefined && exhausted.has(bearer)) return reject(USAGE_LIMIT_REJECTION, 429);
+			if (payload.tools?.some(tool => tool.strict === true)) return reject(GRAMMAR_REJECTION, 400);
+			if (payload.speed !== undefined && (bearer === undefined || !entitled.has(bearer))) {
+				return reject(FAST_MODE_REJECTION, 400);
 			}
 			return new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } });
 		},
@@ -116,6 +164,9 @@ function startUpstream(): Upstream {
 	return {
 		url: `http://127.0.0.1:${server.port}`,
 		payloads,
+		bearers,
+		entitled,
+		exhausted,
 		stop: () => {
 			server.stop(true);
 		},
@@ -133,11 +184,13 @@ interface GatewayFixture {
 async function startGateway(
 	model: Model<Api>,
 	provider: string,
-	options?: { sessionStateMax?: number },
+	options?: { sessionStateMax?: number; oauth?: boolean },
 ): Promise<GatewayFixture> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-session-state-"));
 	const storage = await AuthStorage.create(path.join(dir, "auth.db"));
-	storage.setRuntimeApiKey(provider, "sk-ant-api-test");
+	// A runtime override outranks every stored row and blocks account pinning,
+	// so the OAuth tests seed credentials instead.
+	if (!options?.oauth) storage.setRuntimeApiKey(provider, "sk-ant-api-test");
 	const handle = startAuthGateway({
 		bind: "127.0.0.1:0",
 		bearerTokens: ["test-token"],
@@ -167,6 +220,49 @@ async function startGateway(
 /** One store request for a client-keyed session, as a gateway handler builds it. */
 function stateRequest(clientKey: string, account = "key:test-account"): AuthGatewaySessionStateRequest {
 	return { clientKey, model: ANTHROPIC_MODEL, context: CONTEXT, account };
+}
+
+/**
+ * One stored OAuth row. `orgId` is what lets two rows of the same account sit
+ * side by side: `resolveCredentialIdentityKey` keys anthropic rows
+ * `<base>|org:<id>`, so a Team seat and a personal plan of one login are two
+ * credentials rather than one overwritten row.
+ */
+function oauthAccount(ids: { suffix: string; accountId: string; orgId: string }): OAuthCredential {
+	return {
+		type: "oauth",
+		access: `access-${ids.suffix}`,
+		refresh: `refresh-${ids.suffix}`,
+		expires: Date.now() + 60 * 60_000,
+		accountId: ids.accountId,
+		email: "shared@example.com",
+		orgId: ids.orgId,
+	};
+}
+
+/**
+ * Hand `getApiKey` the stored access token verbatim. Without this the OAuth
+ * path would try to mint one against the real token endpoint.
+ */
+function mockOAuthAccess(): void {
+	vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (provider, credentials) => {
+		const credential = credentials[provider];
+		return credential ? { newCredentials: credential, apiKey: credential.access } : null;
+	});
+}
+
+/**
+ * Switch a session onto a stored account, the way the account picker and the
+ * usage-limit handoff both do. `orgId` picks between two rows of one account.
+ */
+function pinAccount(storage: AuthStorage, sessionId: string, accountId: string, orgId?: string): void {
+	const target = storage
+		.listOAuthAccounts("anthropic", sessionId)
+		.find(account => account.accountId === accountId && (orgId === undefined || account.orgId === orgId));
+	if (!target) throw new Error(`no stored account ${accountId}${orgId ? `/${orgId}` : ""}`);
+	if (!storage.pinSessionOAuthAccount("anthropic", sessionId, target.credentialId)) {
+		throw new Error(`could not pin account ${accountId}`);
+	}
 }
 
 /**
@@ -224,9 +320,52 @@ async function priorityChatTurn(
 	return priorityChatHistory(handle, modelId, [{ role: "user", content: prompt }]);
 }
 
+/**
+ * One tool-carrying turn through the pi-native route. `bash` is on Anthropic's
+ * strict-tool allowlist and the schema is a closed object, so the tool goes out
+ * `strict: true` until the session learns the endpoint rejects the compiled
+ * grammar.
+ */
+async function toolTurn(
+	handle: AuthGatewayServerHandle,
+	sessionId: string,
+	modelId: string,
+): Promise<{ status: number; body: unknown }> {
+	const response = await fetch(`${handle.url}/v1/pi/stream`, {
+		method: "POST",
+		headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
+		body: JSON.stringify({
+			modelId,
+			context: {
+				...CONTEXT,
+				tools: [
+					{
+						name: "bash",
+						description: "Run a shell command",
+						strict: true,
+						parameters: {
+							type: "object",
+							properties: { command: { type: "string" } },
+							required: ["command"],
+							additionalProperties: false,
+						},
+					},
+				],
+			},
+			options: { sessionId },
+			stream: false,
+		}),
+	});
+	return { status: response.status, body: await response.json() };
+}
+
 withOfficialAnthropicEndpoint();
 
 describe("auth-gateway provider session state", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
 	it("carries a session's learned fast-mode fallback into its next request", async () => {
 		const upstream = startUpstream();
 		const model = makeAnthropicModel(upstream.url);
@@ -359,24 +498,96 @@ describe("auth-gateway provider session state", () => {
 		}
 	});
 
-	it("keeps one map per session across a credential switch instead of splitting by account", () => {
-		const store = new AuthGatewaySessionStateStore();
-		const closed: string[] = [];
-		const first = store.acquire(stateRequest("session-a", "account:one"));
-		first.states.set("endpoint-lesson", { close: () => closed.push("endpoint-lesson") });
-		first.release();
+	it("keeps the endpoint-scoped lesson a session learned when its credential switches", async () => {
+		const upstream = startUpstream();
+		const model = makeAnthropicModel(upstream.url);
+		const gateway = await startGateway(model, "anthropic");
+		try {
+			// Turn one pays the grammar-too-large rejection and retries non-strict.
+			expect(await toolTurn(gateway.handle, "session-a", model.id)).toMatchObject({ status: 200 });
 
-		const rotated = store.acquire(stateRequest("session-a", "account:two"));
+			// Same conversation, next credential. The compiled tool grammar is a
+			// property of the deployment, so keying the retained state by credential
+			// — or rebuilding it wholesale on a switch — makes this turn re-pay a
+			// round trip the session already paid for.
+			gateway.storage.setRuntimeApiKey("anthropic", "sk-ant-api-sibling");
+			expect(await toolTurn(gateway.handle, "session-a", model.id)).toMatchObject({ status: 200 });
 
-		// Keying by credential would fragment lessons that hold for the endpoint
-		// whoever calls it (tool-grammar limits, signing-proxy demotions) and
-		// re-pay them per account. The switch keeps the entry and its records;
-		// only the account-dependent flags inside them are reset.
-		expect(rotated.states).toBe(first.states);
-		expect(rotated.states.get("endpoint-lesson")).toBeDefined();
-		expect(closed).toEqual([]);
-		expect(store.size).toBe(1);
-		rotated.release();
+			expect(upstream.payloads.map(payload => payload.tools?.some(tool => tool.strict === true))).toEqual([
+				true,
+				false,
+				false,
+			]);
+		} finally {
+			await gateway.cleanup();
+			upstream.stop();
+		}
+	});
+
+	it("re-probes the account-scoped lesson on the retry that rotated, not a turn later", async () => {
+		const upstream = startUpstream();
+		const model = makeAnthropicModel(upstream.url);
+		const gateway = await startGateway(model, "anthropic", { oauth: true });
+		try {
+			mockOAuthAccess();
+			await gateway.storage.set("anthropic", [
+				oauthAccount({ suffix: "alpha", accountId: "acc-alpha", orgId: "org-alpha" }),
+				oauthAccount({ suffix: "beta", accountId: "acc-beta", orgId: "org-beta" }),
+			]);
+			// The sibling's plan includes fast mode; the first account's does not.
+			upstream.entitled.add("access-beta");
+			pinAccount(gateway.storage, "session-a", "acc-alpha");
+
+			// Turn one learns that this account has no fast-mode entitlement.
+			expect(await priorityTurn(gateway.handle, "session-a", model.id)).toMatchObject({ status: 200 });
+
+			// Turn two: the account's quota window is spent, so the gateway blocks
+			// it and the in-request retry rotates to the sibling. Comparing accounts
+			// only at the next request boundary leaves that retry running on the
+			// blocked account's verdict, and the rotated turn silently gives up the
+			// priority routing the client asked for and the new account can serve.
+			upstream.exhausted.add("access-alpha");
+			expect(await priorityTurn(gateway.handle, "session-a", model.id)).toMatchObject({ status: 200 });
+
+			expect(upstream.payloads.map(payload => payload.speed)).toEqual(["fast", undefined, undefined, "fast"]);
+			expect(upstream.bearers).toEqual(["access-alpha", "access-alpha", "access-alpha", "access-beta"]);
+		} finally {
+			await gateway.cleanup();
+			upstream.stop();
+		}
+	});
+
+	it("treats two org-scoped subscriptions of one account as different accounts", async () => {
+		const upstream = startUpstream();
+		const model = makeAnthropicModel(upstream.url);
+		const gateway = await startGateway(model, "anthropic", { oauth: true });
+		try {
+			mockOAuthAccess();
+			// One Anthropic login holding two org-scoped subscriptions: same
+			// account id and email, one Team seat and one personal plan, stored
+			// side by side because `resolveCredentialIdentityKey` keys anthropic
+			// rows `<base>|org:<id>`.
+			await gateway.storage.set("anthropic", [
+				oauthAccount({ suffix: "team", accountId: "acc-shared", orgId: "org-team" }),
+				oauthAccount({ suffix: "personal", accountId: "acc-shared", orgId: "org-personal" }),
+			]);
+			// The personal plan includes fast mode; the Team seat does not.
+			upstream.entitled.add("access-personal");
+			pinAccount(gateway.storage, "session-a", "acc-shared", "org-team");
+			expect(await priorityTurn(gateway.handle, "session-a", model.id)).toMatchObject({ status: 200 });
+
+			// Same account id and email, different subscription. An identity that
+			// stops at the shared base reads this as no switch at all, and the turn
+			// runs on the other subscription's entitlement verdict.
+			pinAccount(gateway.storage, "session-a", "acc-shared", "org-personal");
+			expect(await priorityTurn(gateway.handle, "session-a", model.id)).toMatchObject({ status: 200 });
+
+			expect(upstream.payloads.map(payload => payload.speed)).toEqual(["fast", undefined, "fast"]);
+			expect(upstream.bearers).toEqual(["access-team", "access-team", "access-personal"]);
+		} finally {
+			await gateway.cleanup();
+			upstream.stop();
+		}
 	});
 
 	it("closes the provider state it evicts at the session ceiling", () => {

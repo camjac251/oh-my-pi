@@ -46,6 +46,7 @@ import {
 	withCors,
 } from "./http";
 import { AuthGatewaySessionStateStore } from "./session-state";
+import type { AuthGatewaySessionStateLease } from "./session-state";
 import type {
 	AuthGatewayServerHandle,
 	AuthGatewayServerOptions,
@@ -157,13 +158,34 @@ function normalizeClientSessionKey(clientKey: string | undefined): string | unde
  * like a rotation every time a token refreshes and discard the retained
  * lessons for nothing. Key-based rows fall back to a hash of the key, never
  * the key itself: this value is held for the lifetime of the entry.
+ *
+ * Shape mirrors `usageOverlayKey`, the other place a runtime scope is derived
+ * from these same fields: an org qualifier carrying whichever base identity is
+ * known. Neither half is sufficient alone. One Anthropic / ChatGPT account
+ * holds several org-scoped subscriptions (a Team seat plus a personal plan),
+ * each its own entitlement pool, and `AuthStorage` stores them side by side —
+ * `resolveCredentialIdentityKey` keys those rows `<base>|org:<id>`, so two rows
+ * genuinely share an `accountId` and an email while differing in `orgId`, and a
+ * base-only identity would call a rotation between them no switch at all. Two
+ * members of one org share the `orgId` while drawing on per-member pools, so
+ * the base stays in the key whenever it is known.
  */
 function resolveGatewayAccount(storage: AuthStorage, provider: string, sessionId: string, apiKey: string): string {
 	const identity = storage.getOAuthAccountIdentity(provider, sessionId);
-	if (identity?.accountId) return `account:${identity.accountId}`;
-	if (identity?.email) return `email:${identity.email}`;
-	if (identity?.projectId) return `project:${identity.projectId}`;
-	if (identity?.orgId) return `org:${identity.orgId}`;
+	if (identity !== undefined) {
+		// `accountId` first: the most stable of the three. An email can be
+		// re-cased or fail to come back from an identity bootstrap, and either
+		// would read as a rotation.
+		const account = identity.accountId?.trim();
+		const email = identity.email?.trim().toLowerCase();
+		const project = identity.projectId?.trim();
+		const base = account ? `account:${account}` : email ? `email:${email}` : project ? `project:${project}` : "";
+		const org = identity.orgId?.trim();
+		// An org-less row (stored before org capture existed) keeps its bare
+		// base, exactly as its stored identity key does.
+		if (org) return base ? `org:${org}|${base}` : `org:${org}`;
+		if (base) return base;
+	}
 	return `key:${Bun.hash(apiKey).toString(36)}`;
 }
 
@@ -331,6 +353,17 @@ async function refreshGatewayApiKeyAfterAuthError(
  *
  * `lastKey` tracks the most recent bearer so the switch step invalidates the
  * credential that actually failed.
+ *
+ * Every re-resolve retargets `lease` onto whatever account the returned key now
+ * belongs to, so the retried attempt does not run on the previous account's
+ * learning — a chain baseline minted by the account that just got blocked
+ * answers `Previous response not found`, and a fast-mode verdict from it is an
+ * entitlement the sibling may well have. This is the only mid-request point
+ * where that reset is safe: `streamSimple`'s auth-retry loop awaits the
+ * resolver strictly between attempts, so the failed attempt has settled and the
+ * next has not been issued. The reset is a no-op when the key still resolves to
+ * the same account, which is the whole of step (b) and any rotation onto a
+ * second row of one account.
  */
 function buildGatewayApiKeyResolver(
 	storage: AuthStorage,
@@ -340,8 +373,12 @@ function buildGatewayApiKeyResolver(
 	requestSignal: AbortSignal,
 	format: string,
 	peer: string,
+	lease: AuthGatewaySessionStateLease,
 ): ApiKeyResolver {
 	let lastKey = initialKey;
+	const retarget = (key: string): void => {
+		lease.retarget(resolveGatewayAccount(storage, model.provider, sessionId, key));
+	};
 	return async ({ lastChance, error, signal }) => {
 		const sig = signal ?? requestSignal;
 		if (error === undefined) {
@@ -355,6 +392,7 @@ function buildGatewayApiKeyResolver(
 				forceRefresh: true,
 			});
 			lastKey = refreshed ?? lastKey;
+			if (refreshed !== undefined) retarget(refreshed);
 			return refreshed;
 		}
 		const next = await refreshGatewayApiKeyAfterAuthError(
@@ -369,6 +407,7 @@ function buildGatewayApiKeyResolver(
 			peer,
 		);
 		lastKey = next ?? lastKey;
+		if (next !== undefined) retarget(next);
 		return next;
 	};
 }
@@ -532,6 +571,20 @@ async function handleFormatEndpoint(
 	}
 
 	const streamOpts = buildStreamOptions(parsed, model.api, controller.signal);
+	// Per-session provider learning (sticky strict-tools / fast-mode / thinking
+	// fallbacks, Codex transport sessions). Owned by this gateway instance: the
+	// map is non-serializable, so no client can supply it and every turn would
+	// otherwise re-learn each lesson from a fresh upstream rejection. The lease
+	// keeps the entry out of reach of eviction until this request is done with
+	// it, so it MUST be released on every exit path. Acquired before the
+	// resolver because the resolver retargets it when an auth retry rotates.
+	const lease = sessionStates.acquire({
+		clientKey,
+		model,
+		context: parsed.context,
+		account: resolveGatewayAccount(bootOpts.storage, model.provider, sessionId, apiKey),
+	});
+	streamOpts.providerSessionState = lease.states;
 	streamOpts.apiKey = buildGatewayApiKeyResolver(
 		bootOpts.storage,
 		model,
@@ -540,20 +593,8 @@ async function handleFormatEndpoint(
 		controller.signal,
 		route.label,
 		peer,
+		lease,
 	);
-	// Per-session provider learning (sticky strict-tools / fast-mode / thinking
-	// fallbacks, Codex transport sessions). Owned by this gateway instance: the
-	// map is non-serializable, so no client can supply it and every turn would
-	// otherwise re-learn each lesson from a fresh upstream rejection. The lease
-	// keeps the entry out of reach of eviction until this request is done with
-	// it, so it MUST be released on every exit path.
-	const lease = sessionStates.acquire({
-		clientKey,
-		model,
-		context: parsed.context,
-		account: resolveGatewayAccount(bootOpts.storage, model.provider, sessionId, apiKey),
-	});
-	streamOpts.providerSessionState = lease.states;
 
 	logger.info("auth-gateway request", {
 		requestId,
@@ -739,6 +780,8 @@ async function handlePiNative(
 	// every turn would otherwise re-learn each lesson from a fresh upstream
 	// rejection. The lease keeps the entry out of reach of eviction until this
 	// request is done with it, so it MUST be released on every exit path.
+	// Acquired before the resolver: the resolver retargets it when an auth
+	// retry rotates the credential.
 	const lease = sessionStates.acquire({
 		clientKey,
 		model,
@@ -764,6 +807,7 @@ async function handlePiNative(
 		controller.signal,
 		"pi-native",
 		peer,
+		lease,
 	);
 	if (model.api === "openai-codex-responses") {
 		delete streamOpts.temperature;

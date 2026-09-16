@@ -5,7 +5,7 @@
 ### Fixed
 
 - The auth gateway no longer hands two unrelated conversations the same retained provider state when the client sends no session key: the retained map now follows the conversation's own message history, so one chat's rejected request stops silencing another chat's ([#12241](https://github.com/can1357/oh-my-pi/pull/12241) by [@camjac251](https://github.com/camjac251)).
-- Retained provider state no longer carries an account-specific lesson across a credential switch. When the gateway moves a session to a sibling account, Anthropic's fast-mode entitlement and OpenAI Responses' stored-response chains are re-probed while endpoint-learned fallbacks (tool-grammar limits, signing-proxy demotions, effort fallbacks) are kept ([#12241](https://github.com/can1357/oh-my-pi/pull/12241) by [@camjac251](https://github.com/camjac251)).
+- Retained provider state no longer carries an account-specific lesson across a credential switch. When the gateway moves a session to a sibling account — including on the retry that rotated, and between two org-scoped subscriptions of one login — Anthropic's fast-mode entitlement and OpenAI Responses' stored-response chains are re-probed while endpoint-learned fallbacks (tool-grammar limits, signing-proxy demotions, effort fallbacks) are kept ([#12241](https://github.com/can1357/oh-my-pi/pull/12241) by [@camjac251](https://github.com/camjac251)).
 - The auth gateway no longer closes provider state a request is still streaming through when the retained-session ceiling is reached: an entry an in-flight request holds is skipped when making room and reclaimed as soon as that request ends ([#12241](https://github.com/can1357/oh-my-pi/pull/12241) by [@camjac251](https://github.com/camjac251)).
 
 ## [18.2.1] - 2026-09-15
