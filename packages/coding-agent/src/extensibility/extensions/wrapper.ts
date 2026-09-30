@@ -12,11 +12,15 @@ import {
 import type { ComputerSafetyCheck, ImageContent, Static, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import { sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Theme } from "@oh-my-pi/pi-tui/theme";
-import { getPermissionIntent, withApprovedAcpToolCall, withRequiredAcpApproval } from "../../session/acp-permission-gate";
+import {
+	getPermissionIntent,
+	withApprovedAcpToolCall,
+	withRequiredAcpApproval,
+} from "../../session/acp-permission-gate";
 import { denyError, formatApprovalPrompt, resolveApproval, resolveApprovalFromContext } from "../../tools/approval";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { withFileMutationSession } from "../../tools/file-write-fallback";
-import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
+import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
@@ -370,7 +374,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				signal,
 			);
 			if (authorization?.decision === "deny") {
-				throw new Error(authorization.reason || `Tool execution was denied by an extension: ${this.tool.name}`);
+				cancelPreflight();
+				throw new Error(authorization.reason || "Tool execution was denied by an extension: " + this.tool.name);
 			}
 			if (authorization?.decision === "ask") {
 				extensionApprovalRequired = true;
@@ -384,11 +389,18 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					this.runner.reportToolApprovalAttention(toolCallId, false, "native");
 				}
 			}
+			// Direct/Cursor and nested dispatches cross the same gate without a scheduled call.
+			// Only preview waiting depends on scheduling; disclosure depends on authorization.
+			await this.runner.reportAuthorizedToolInput(
+				toolCallId,
+				matchesScheduledCall ? scheduledCall.name : this.tool.name,
+				effectiveParams,
+			);
 		}
 
-		const deferExtensionApprovalToAcp =
+		const deferApprovalToAcp =
 			this.hasAcpPermissionFallback &&
-			extensionApprovalRequired &&
+			approvalCheck.required &&
 			pendingSafetyChecks.length === 0 &&
 			context?.hasUI !== true &&
 			getPermissionIntent(this.tool.name, effectiveParams) !== undefined;
@@ -420,7 +432,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			});
 		};
 
-		if (approvalCheck.required && !deferExtensionApprovalToAcp) {
+		if (approvalCheck.required && !deferApprovalToAcp) {
 			if (matchesScheduledCall && !hasFinalAuthorization) {
 				await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
 			}
@@ -501,12 +513,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			const executeTool = () => this.tool.execute(toolCallId, effectiveParams, signal, onUpdate, context);
 			result = await this.runner.runScoped(() =>
 				withFileMutationSession(this.runner.sessionId, () => {
-					if (extensionApprovalGranted)
-						return withApprovedAcpToolCall(toolCallId, this.tool.name, executeTool);
-					if (deferExtensionApprovalToAcp) {
+					if (extensionApprovalGranted) return withApprovedAcpToolCall(toolCallId, this.tool.name, executeTool);
+					if (deferApprovalToAcp) {
 						return withRequiredAcpApproval(
 							toolCallId,
 							this.tool.name,
+							extensionApprovalRequired,
 							approvalReason,
 							hasApprovalHandlers
 								? { requested: emitApprovalRequested, resolved: emitApprovalResolved }

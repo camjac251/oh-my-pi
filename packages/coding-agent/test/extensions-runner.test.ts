@@ -35,7 +35,7 @@ import type {
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TRUNCATE_LENGTHS } from "@oh-my-pi/pi-coding-agent/tools/render-utils";
+import { TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
@@ -3232,9 +3232,6 @@ describe("ExtensionRunner", () => {
 			} as AgentTool;
 		}
 
-		const yoloContext = {
-			settings: { get: (key: string) => (key === "tools.approvalMode" ? "yolo" : {}) },
-		} as never;
 		// Minimal runtime init so the approval gate's interactive `select` is wired for prompt-path tests.
 		const initApprovalRunner = (
 			runner: ExtensionRunner,
@@ -4061,7 +4058,7 @@ describe("ExtensionRunner", () => {
 			initApprovalRunner(runner, async () => undefined, { confirm });
 			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
 			const context = {
-				settings: { get: (key: string) => (key === "tools.approvalMode" ? "yolo" : {}) },
+				settings: Settings.isolated({ "tools.approvalMode": "yolo" }),
 				toolCall: {
 					batchId: "authorization-preview-batch",
 					index: 0,
@@ -4099,7 +4096,7 @@ describe("ExtensionRunner", () => {
 			);
 			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
 			const context = {
-				settings: { get: (key: string) => (key === "tools.approvalMode" ? "yolo" : {}) },
+				settings: Settings.isolated({ "tools.approvalMode": "yolo" }),
 			} as never;
 
 			await wrapped.execute("call-authorization-session", {}, undefined, undefined, context);
@@ -4130,13 +4127,7 @@ describe("ExtensionRunner", () => {
 
 			try {
 				const result = await loadTestExtensions();
-				const settings = {
-					get: (key: string) => {
-						if (key === "tools.approvalMode") return "always-ask";
-						if (key === "tools.approval") return {};
-						return undefined;
-					},
-				} as never;
+				const settings = Settings.isolated({ "tools.approvalMode": "always-ask" });
 				const runner = new ExtensionRunner(
 					result.extensions,
 					result.runtime,
@@ -4282,7 +4273,7 @@ describe("ExtensionRunner", () => {
 			const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ran" }] }));
 			const wrapped = new ExtensionToolWrapper({ ...createApprovalTool(), execute } as AgentTool, runner);
 			const context = {
-				settings: { get: (key: string) => (key === "tools.approvalMode" ? "yolo" : {}) },
+				settings: Settings.isolated({ "tools.approvalMode": "yolo" }),
 				toolCall: {
 					batchId: "computer-action-batch",
 					index: 0,
@@ -4870,13 +4861,10 @@ describe("ExtensionRunner", () => {
 
 			const wrapped = new ExtensionToolWrapper(createApprovalTool(), runner);
 			await wrapped.execute("call-explicit-prompt", {}, undefined, undefined, {
-				settings: {
-					get: (key: string) => {
-						if (key === "tools.approvalMode") return "yolo";
-						if (key === "tools.approval") return { dangerous_tool: "prompt" };
-						return undefined;
-					},
-				} as never,
+				settings: Settings.isolated({
+					"tools.approvalMode": "yolo",
+					"tools.approval": { dangerous_tool: "prompt" },
+				}),
 			} as never);
 
 			expect(select).toHaveBeenCalledTimes(1);
@@ -4994,7 +4982,7 @@ describe("ExtensionRunner", () => {
 			const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "ran" }] }));
 			const wrapped = new ExtensionToolWrapper({ ...createApprovalTool(), execute } as AgentTool, runner);
 			const context = {
-				settings: { get: (key: string) => (key === "tools.approvalMode" ? "yolo" : {}) },
+				settings: Settings.isolated({ "tools.approvalMode": "yolo" }),
 				toolCall: {
 					batchId: "provider-safety-batch",
 					index: 0,

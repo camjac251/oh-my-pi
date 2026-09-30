@@ -45,6 +45,7 @@ import {
 	PERMISSION_OPTIONS,
 	PERMISSION_OPTIONS_BY_ID,
 	PERMISSION_REQUIRED_TOOLS,
+	requiresAcpApproval,
 	requiresFreshAcpApproval,
 } from "./acp-permission-gate";
 import type { ClientBridge, ClientBridgePermissionOutcome } from "./client-bridge";
@@ -950,7 +951,7 @@ export class SessionTools {
 						? [{ type: "content" as const, content: { type: "text" as const, text: `$ ${command}` } }]
 						: undefined;
 					const freshApprovalRequired = requiresFreshAcpApproval(toolCallId, target.name);
-					if (permissionOnlyWhenRequired && !freshApprovalRequired) {
+					if (permissionOnlyWhenRequired && !requiresAcpApproval(toolCallId, target.name)) {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
 					// Short-circuit on persisted decisions.
@@ -963,7 +964,7 @@ export class SessionTools {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
 					if (persisted === "allow_always" && !freshApprovalRequired) {
-						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
+						return await target.execute(toolCallId, args as never, signal, onUpdate, approvedCtx);
 					}
 					if (signal?.aborted) {
 						throw new ToolAbortError("Permission request cancelled");

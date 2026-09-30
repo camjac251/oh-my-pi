@@ -34,6 +34,7 @@ type AcpApprovalScope = {
 	mode: "approved" | "required";
 	reason?: string;
 	lifecycle?: AcpApprovalLifecycle;
+	fresh?: boolean;
 };
 
 const acpApprovalScope = new AsyncLocalStorage<AcpApprovalScope>();
@@ -54,6 +55,7 @@ export function isApprovedAcpToolCall(toolCallId: string, toolName: string): boo
 export function withRequiredAcpApproval<T>(
 	toolCallId: string,
 	toolName: string,
+	fresh: boolean,
 	reason: string | undefined,
 	lifecycle: AcpApprovalLifecycle | undefined,
 	execute: () => Promise<T>,
@@ -63,6 +65,7 @@ export function withRequiredAcpApproval<T>(
 			toolCallId,
 			toolName,
 			mode: "required",
+			fresh,
 			...(reason ? { reason } : {}),
 			...(lifecycle ? { lifecycle } : {}),
 		},
@@ -77,8 +80,12 @@ function requiredAcpApprovalScope(toolCallId: string, toolName: string): AcpAppr
 		: undefined;
 }
 
-export function requiresFreshAcpApproval(toolCallId: string, toolName: string): boolean {
+export function requiresAcpApproval(toolCallId: string, toolName: string): boolean {
 	return requiredAcpApprovalScope(toolCallId, toolName) !== undefined;
+}
+
+export function requiresFreshAcpApproval(toolCallId: string, toolName: string): boolean {
+	return requiredAcpApprovalScope(toolCallId, toolName)?.fresh === true;
 }
 
 export function getRequiredAcpApprovalReason(toolCallId: string, toolName: string): string | undefined {

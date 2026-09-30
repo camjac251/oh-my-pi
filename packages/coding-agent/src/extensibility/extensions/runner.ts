@@ -37,7 +37,7 @@ import type { AsyncJobSnapshot } from "../../session/agent-session";
 import { MAIN_AGENT_ID } from "../../registry/agent-registry";
 import type { SessionManager } from "../../session/session-manager";
 import { addFileDeleteFallback, addFileWriteFallback } from "../../tools/file-write-fallback";
-import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
+import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
 import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 import { accumulateToolCallResult, buildAggregatedToolCallResult } from "../shared-events";
 import { ManagedTimers } from "./managed-timers";
@@ -530,6 +530,7 @@ export class ExtensionRunner {
 	#mode: ExtensionMode = "print";
 	#toolApprovalPreviewWaiter?: (toolCallId: string) => Promise<void>;
 	#toolApprovalAttentionHandler?: (toolCallId: string, active: boolean, source: ToolApprovalAttentionSource) => void;
+	#authorizedToolInputHandler?: (toolCallId: string, toolName: string, args: unknown) => Promise<void>;
 	#errorListeners: Set<ExtensionErrorListener> = new Set();
 	#getModel: () => Model | undefined = () => undefined;
 	#isIdleFn: () => boolean = () => true;
@@ -1069,6 +1070,16 @@ export class ExtensionRunner {
 
 	reportToolApprovalAttention(toolCallId: string, active: boolean, source: ToolApprovalAttentionSource): void {
 		this.#toolApprovalAttentionHandler?.(toolCallId, active, source);
+	}
+	/** ACP withholds loop previews until the final extension gate accepts the execution input. */
+	setAuthorizedToolInputHandler(
+		handler: (toolCallId: string, toolName: string, args: unknown) => Promise<void>,
+	): void {
+		this.#authorizedToolInputHandler = handler;
+	}
+
+	async reportAuthorizedToolInput(toolCallId: string, toolName: string, args: unknown): Promise<void> {
+		await this.#authorizedToolInputHandler?.(toolCallId, toolName, args);
 	}
 
 	getUIContext(): ExtensionUIContext {
@@ -1898,7 +1909,8 @@ export class ExtensionRunner {
 	): Promise<ToolAuthorizationEventResult | undefined> {
 		const ctx = this.createContext();
 		const timeoutMs = normalizeHandlerTimeout(
-			this.settings?.get("extensionHandlers.toolCallTimeoutMs") ?? extensionHandlerTimeoutMs,
+			(this.settings ? cfgExtensionHandlersToolCallTimeoutMs.get(this.settings) : undefined) ??
+				extensionHandlerTimeoutMs,
 		);
 		let result: ToolAuthorizationEventResult | undefined;
 

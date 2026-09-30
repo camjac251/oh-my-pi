@@ -26,7 +26,7 @@ import type {
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { TRUNCATE_LENGTHS } from "@oh-my-pi/pi-coding-agent/tools/render-utils";
+import { TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
 import { dispatchXdevTool, resolveMountedXdevExecutable, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -374,7 +374,7 @@ it("extension ask emits approval lifecycle events around deferred ACP permission
 		{ command: "echo hi" },
 		undefined,
 		undefined as never,
-		{ hasUI: false } as never,
+		{ hasUI: false, settings: session.settings } as never,
 	);
 
 	expect(order).toEqual(["requested", "requestPermission", "resolved", "execute"]);
@@ -783,29 +783,32 @@ function noUiRunner(): ExtensionRunner {
 	} as unknown as ExtensionRunner;
 }
 
-it("always-ask: an ACP grant satisfies the inner wrapper's explicit prompt policy", async () => {
-	// In a real ACP session every registry tool is wrapped by ExtensionToolWrapper,
-	// then again by the ACP permission gate. The client has answered the explicit
-	// prompt, so the inner wrapper must not request the unavailable interactive UI.
-	const bashTool = makeFakeTool("bash");
-	const wrapped = new ExtensionToolWrapper(bashTool, noUiRunner()) as unknown as AgentTool;
-	const bridge = makeBridge({ outcome: "selected", optionId: "allow_once", kind: "allow_once" });
-	const permissionSpy = spyOn(bridge, "requestPermission");
-	const approvalSettings: Record<string, unknown> = {
-		"tools.approvalMode": "always-ask",
-		"tools.approval": { bash: "prompt" },
-	};
-	session = await createSession([wrapped], bridge, approvalSettings);
+it.each(["allow_once", "allow_always"] as const)(
+	"always-ask: ACP %s grants satisfy the explicit prompt policy",
+	async decision => {
+		// In a real ACP session every registry tool is wrapped by ExtensionToolWrapper,
+		// then again by the ACP permission gate. The client has answered the explicit
+		// prompt, so the inner wrapper must not request the unavailable interactive UI.
+		const bashTool = makeFakeTool("bash");
+		const wrapped = new ExtensionToolWrapper(bashTool, noUiRunner()) as unknown as AgentTool;
+		const bridge = makeBridge({ outcome: "selected", optionId: decision, kind: decision });
+		const permissionSpy = spyOn(bridge, "requestPermission");
+		const approvalSettings: Record<string, unknown> = {
+			"tools.approvalMode": "always-ask",
+			"tools.approval": { bash: "prompt" },
+		};
+		session = await createSession([wrapped], bridge, approvalSettings);
 
-	await session.setActiveToolsByName(["bash"]);
-	const gatedBash = session.agent.state.tools.find(t => t.name === "bash");
-	const ctx = { settings: Settings.isolated(approvalSettings) } as never;
+		await session.setActiveToolsByName(["bash"]);
+		const gatedBash = session.agent.state.tools.find(t => t.name === "bash");
+		const ctx = { settings: Settings.isolated(approvalSettings) } as never;
 
-	await gatedBash!.execute("call-1", { command: "echo hi" }, undefined, undefined as never, ctx);
-
-	expect(permissionSpy).toHaveBeenCalledTimes(1);
-	expect(bashTool.executeCalls).toBe(1);
-});
+		await gatedBash!.execute("call-1", { command: "echo hi" }, undefined, undefined as never, ctx);
+		await gatedBash!.execute("call-2", { command: "echo again" }, undefined, undefined as never, ctx);
+		expect(permissionSpy).toHaveBeenCalledTimes(decision === "allow_once" ? 2 : 1);
+		expect(bashTool.executeCalls).toBe(2);
+	},
+);
 
 it("always-ask: an ordinary edit without an ACP grant still faces the inner approval gate", async () => {
 	const editTool = makeFakeTool("edit");

@@ -21,6 +21,7 @@ import * as titleGenerator from "@oh-my-pi/pi-coding-agent/utils/title-generator
 import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
 
 import { cfgDisplaySmoothStreaming } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import { cfgToolsApprovalMode } from "@oh-my-pi/pi-coding-agent/tools/settings";
 
 beforeAll(async () => {
 	await initTheme();
@@ -331,7 +332,7 @@ describe("EventController paces streamed tool args", () => {
 
 	it("clears native attention when authorization suppresses its prompt", async () => {
 		await Settings.init({ inMemory: true, cwd: process.cwd() });
-		settings.override("tools.approvalMode", "always-ask");
+		cfgToolsApprovalMode.set(settings, "always-ask");
 		const stateSpy = vi.spyOn(titleGenerator, "setTerminalTitleState").mockImplementation(() => {});
 		const tool = {
 			name: "dangerous_tool",
@@ -355,7 +356,7 @@ describe("EventController paces streamed tool args", () => {
 
 	it("keeps Ask attention when authorization suppresses native approval", async () => {
 		await Settings.init({ inMemory: true, cwd: process.cwd() });
-		settings.override("tools.approvalMode", "always-ask");
+		cfgToolsApprovalMode.set(settings, "always-ask");
 		const stateSpy = vi.spyOn(titleGenerator, "setTerminalTitleState").mockImplementation(() => {});
 		const tool = {
 			name: "ask",
